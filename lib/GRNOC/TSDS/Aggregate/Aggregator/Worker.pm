@@ -1,4 +1,4 @@
-package GRNOC::TSDS::Aggregator::Aggregate::Worker;
+package GRNOC::TSDS::Aggregate::Aggregator::Worker;
 
 use Moo;
 
@@ -37,6 +37,8 @@ has is_running => ( is => 'rwp',
 has rabbit => ( is => 'rwp' );
 
 has json => ( is => 'rwp' );
+
+has websvc => ( is => 'rwp' );
 
 ### public methods ###
 
