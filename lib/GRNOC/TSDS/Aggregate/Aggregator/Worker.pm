@@ -3,6 +3,7 @@ package GRNOC::TSDS::Aggregate::Aggregator::Worker;
 use Moo;
 
 use GRNOC::WebService::Client;
+use GRNOC::TSDS::Aggregate::Aggregator::Message;
 
 use Net::AMQP::RabbitMQ;
 use JSON::XS;
@@ -273,7 +274,7 @@ sub _consume_messages {
         my $end = $message->{'end'};
         my $meta = $message->{'meta'};
 	my $values = $message->{'values'};
-	my $required_fields = $message->{'required_fields'};
+	my $required_meta = $message->{'required_meta'};
 
 	my $aggregate_message;
 
@@ -286,7 +287,7 @@ sub _consume_messages {
 										   end => $end,
 										   meta => $meta,
 										   values => $values,
-										   required_fields => $required_fields );
+										   required_meta => $required_meta );
 	}
 
 	catch {
@@ -328,16 +329,18 @@ sub _aggregate_messages {
 	my $end = $message->end;
 	my $meta = $message->meta;
 	my $values = $message->values;
-	my $required_fields = $message->required_fields;
+	my $required_meta = $message->required_meta;
 
 	# craft the query needed to fetch the data from the necessary interval
 	my $from_clause = "from $type";
 	my $values_clause = $self->_get_values_clause( from => $from, values => $values );
 	my $between_clause = $self->_get_between_clause( start => $start, end => $end, from => $from );
 	my $where_clause = $self->_get_where_clause( $meta );
-	my $by_clause = $self->_get_by_clause( $required_fields );
+	my $by_clause = $self->_get_by_clause( $required_meta );
 
 	my $query = "$values_clause $between_clause $by_clause $from_clause $where_clause";
+
+	warn $query;
 
 	# issue the query to the webservice to retrieve the data we need to aggregate
 	my $results = $self->websvc->query( query => $query );
@@ -395,9 +398,9 @@ sub _get_between_clause {
 
 sub _get_by_clause {
 
-    my ( $self, $required_fields ) = @_;
+    my ( $self, $required_meta ) = @_;
 
-    my $by_clause = "by " . join( ',', @$required_fields );
+    my $by_clause = "by " . join( ',', @$required_meta );
 
     return $by_clause;
 }
@@ -417,12 +420,12 @@ sub _get_where_clause {
 	    push( @clause, "$key = \"$value\"" );
 	}
 	
-	my $clause = '( ' . join( ' AND ', @clause ) . ' )';
+	my $clause = '( ' . join( ' and ', @clause ) . ' )';
 
 	push( @or_clauses, $clause );
     }
    
-    my $where_clause = join( ' OR ', @or_clauses );
+    my $where_clause = "where " . join( ' or ', @or_clauses );
 
     return $where_clause;    
 }
