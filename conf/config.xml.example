@@ -8,10 +8,10 @@
 
   <!-- rabbitmq connection info -->
   <rabbit>
-    <pending-queue>pending_aggregate</pending-queue>
-    <finished-queue>finished_aggregate</finished-queue>
     <host>127.0.0.1</host>
     <port>5672</port>
+    <pending-queue>pending_aggregate</pending-queue>
+    <finished-queue>finished_aggregate</finished-queue>
   </rabbit>
 
   <!-- tsds webservice connection info -->
