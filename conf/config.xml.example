@@ -1,0 +1,53 @@
+<config>
+
+  <!-- information for the workers, only needs to be set up
+       for machines running workers-->
+  <worker>
+    <!-- how many concurrent workers should perform the necessary aggregations -->
+    <num-processes>4</num-processes>
+
+    <!-- where should we write the aggregator worker pid file to -->
+    <pid-file>/var/run/tsds_aggregator.pid</pid-file>
+
+    <!-- tsds webservice connection info -->
+    <tsds>
+      <cloud>GlobalNOC</cloud>
+      <username>username</username>
+      <password>password</password>
+      <realm>realm</realm>
+    </tsds>    
+
+  </worker>
+
+  <!-- information for the master process, only needs to be set up
+       for the one machine running the master. One master per cloud! -->
+  <master>
+    
+    <!-- where should we write the aggregator master pid file to -->
+    <pid-file>/var/run/tsds_aggregator_master.pid</pid-file>
+
+    <!-- redis connection information for distributed locking -->
+    <redis>
+      <host>127.0.0.1</host>
+      <port>6379</port>
+    </redis>
+
+    <!-- mongo connection information -->
+    <mongo>
+      <host>127.0.0.1</host>
+      <port>27017</port>
+      <username>needs_rw</username>
+      <password>rw_password</password>
+    </mongo>
+
+  </master>
+
+  <!-- rabbitmq connection info, shared by workers and master -->
+  <rabbit>
+    <host>127.0.0.1</host>
+    <port>5672</port>
+    <pending-queue>pending_aggregate</pending-queue>
+    <finished-queue>finished_aggregate</finished-queue>
+  </rabbit>
+
+</config>
