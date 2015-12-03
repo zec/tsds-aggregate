@@ -5,19 +5,23 @@ use warnings;
 
 use Moo;
 use Types::Standard qw( Str Bool );
+use Try::Tiny;
 
 use GRNOC::Config;
 use GRNOC::Log;
 
 use Proc::Daemon;
 
+use POSIX;
 use Data::Dumper;
+
 use MongoDB;
 
 use Net::AMQP::RabbitMQ;
 use JSON::XS;
 
-use POSIX;
+use Redis;
+use Redis::DistLock;
 
 extends 'GRNOC::TSDS::Aggregate';
 
@@ -25,6 +29,9 @@ extends 'GRNOC::TSDS::Aggregate';
 
 has required_fields => ( is => 'rwp', 
 			 default => sub { {} });
+
+has value_fields => ( is => 'rwp', 
+		     default => sub { {} });
 
 has identifiers => ( is => 'rwp',
 		     default => sub { {} } );
@@ -37,6 +44,11 @@ has mongo => ( is => 'rwp' );
 has rabbit => ( is => 'rwp' );
 
 has rabbit_queue => ( is => 'rwp' );
+
+has locker => ( is => 'rwp' );
+
+has locks => ( is => 'rwp',
+	       default => sub { [] } );
 
 ### public methods ###
 
@@ -80,7 +92,7 @@ sub start {
 
     $self->_rabbit_connect() or return;
 
-    log_debug("Entering main work loop");
+    $self->_redis_connect() or return;
 
     $self->_work_loop();
 
@@ -89,6 +101,8 @@ sub start {
 
 sub _work_loop {
     my ( $self ) = @_;
+
+    log_debug("Entering main work loop");
 
     while (1){
 
@@ -110,19 +124,42 @@ sub _work_loop {
         foreach my $db_name (keys %$dbs){
             my $policies = $dbs->{$db_name};
 
-	    my $next_run = $self->_evaluate_policies($db_name, $policies) or next;
+	    my $next_run;
+
+	    try {
+		# Make sure we know the required fields for this database
+		my $success = $self->_get_metadata($db_name);
+		return if (! defined $success);
+		
+		$next_run = $self->_evaluate_policies($db_name, $policies);
+		next if (! defined $next_run);
+		
+		log_debug("Next run is $next_run for $db_name");
+	    }
+	    catch {
+		log_warn("Caught exception while processing $db_name: $_");
+	    };
+
+	    # Possibly redundant release in case an exception happened above, want
+	    # to make sure we're not hanging on to things
+	    $self->_release_locks();
 
 	    next if (! defined $next_run);
-
-	    log_debug("Next run is $next_run for $db_name");
 
 	    # Figure out when the next time we need to look at this is.
 	    # If it's closer than anything else, update our next wake 
 	    # up time to that
 	    $next_wake_time = $next_run if (! defined $next_wake_time || $next_run < $next_wake_time);	    
 	}
+
+
+	if (! defined $next_wake_time){
+	    log_info("Unable to determine a next wake time, did exceptions happen? Sleeping for 60s and trying again");
+	    $next_wake_time = time() + 60;
+	}
        
         log_debug("Next wake time is $next_wake_time");
+
 
         # Sleep until the next time we've determined we need to do something
         my $delta = $next_wake_time - time;
@@ -151,18 +188,13 @@ sub _evaluate_policies {
     # Keep track of the earliest we need to run next for this db
     my $lowest_next_run;
 
-    # Make sure we know the required fields for this database
-    if (! $self->required_fields->{$db_name}){
-	my $required_fields = $self->_get_required_fields($db_name);
-	return if (! defined $required_fields);
-	$self->required_fields->{$db_name} = $required_fields;
-    }
-
     # Iterate over each policy to figure out what needs doing if anything
     foreach my $policy (@$policies){	
 	my $interval = $policy->{'interval'};
 	my $name     = $policy->{'name'};
 	my $last_run = $policy->{'last_run'} || 0;
+
+	log_debug("Last run for $db_name $name was $last_run");
 
 	my $next_run = $last_run + $interval;
 	
@@ -184,21 +216,26 @@ sub _evaluate_policies {
 							      policies     => $policies,
 							      measurements => $measurements);
 
+
 	    # Figure out from those measurements which have data that needs
 	    # aggregation into this policy
 	    foreach my $prev_interval (keys %$work_buckets){
+		log_debug("Processing data from $prev_interval");
+
 		my $interval_measurements = $work_buckets->{$prev_interval};
 
 		my $dirty_docs = $self->_get_dirty_data($db_name, $prev_interval, $last_run, $interval_measurements);
 		return if (! $dirty_docs);
-		
+
 		# Create and send out rabbit messages describing work that
 		# needs doing
-		my $result = $self->_generate_work(db            => $db_name,
+		my $result = $self->_generate_work(policy        => $policy,
+						   db            => $db_name,
 						   interval_from => $prev_interval,
 						   interval_to   => $interval,
 						   docs          => $dirty_docs,
 						   measurements  => $interval_measurements);
+
 		if (! defined $result){
 		    log_warn("Error generating work for $db_name policy $name, skipping");
 		    return;
@@ -207,13 +244,17 @@ sub _evaluate_policies {
 	    
 	    # Update the aggregate to show the last time we successfully 
 	    # generated work for this
+	    
+	    # Floor the "now" to the interval to make a restart run pick a pretty
+	    # last run time. This is still accurate since floored must be <= $now
+	    my $floored = int($self->now() / $interval) * $interval;
 	    $self->mongo->get_database($db_name)
 		->get_collection("aggregate")
-		->update({"name" => $name}, {'$set' => {"last_run" => $next_run}});
+		->update({"name" => $name}, {'$set' => {"last_run" => $floored}});
 
-
-	    # If we ran, our next run is actually one step ahead
-	    $next_run += $interval;
+	    # Since we ran, the next time we need to look is the next time this
+	    # the next time its interval is coming around in the future
+	    $next_run = $floored + $interval;
 	}
 
 	# Figure out the nearest next run time
@@ -225,7 +266,7 @@ sub _evaluate_policies {
 
 # Returns an array of just the required field names for a given
 # TSDS database
-sub _get_required_fields {
+sub _get_metadata { 
     my ( $self, $db_name ) = @_;
 
     my $metadata;
@@ -247,15 +288,28 @@ sub _get_required_fields {
 	push(@required, $field);
     }
 
+    my @values;
+
+    foreach my $field (keys %{$metadata->{'values'}}){
+	push(@values, $field);
+    }
+
+    # Remember these
+    $self->required_fields->{$db_name} = \@required;
+    $self->value_fields->{$db_name} = \@values;
+
+    log_debug("Required fields for $db_name = " . Dumper(\@required));
+    log_debug("Values for $db_name = " . Dumper(\@values));
+
     # Don't think this should ever be hit, but as a fail safe let's
     # make sure to check we found at least something because otherwise
     # sadness will ensue
-    if (@required == 0){
-	log_warn("Unable to determine required meta fields for $db_name");
+    if (@required == 0 || @values == 0){
+	log_warn("Unable to determine required meta fields and/or value field names for $db_name");
 	return;
     }
 
-    return \@required;
+    return 1;
 }
 
 sub _get_measurements {
@@ -277,38 +331,49 @@ sub _get_measurements {
     # Build up the query we need to aggregate
     my @agg;
 
-    # First we need to match on the meta fields specified in this policy
+    # Hm this isn't technically accurate, we might need to do multiple passes
+    # once we find the data to figure out if the metadata at the time matched
     push(@agg, {'$match' => $obj});
-
-    # Then we need to build up the fields we're going to be grouping together
-    # on. Identifier will always be there then the required fields
-    # This will get us the unique set of identifiers along with the required
-    # fields that went into them
-    my $group = {'identifier' => '$identifier'};
-    foreach my $field (@{$self->required_fields->{$db_name}}){
-	$group->{$field} = '$field';
-    }
-    push(@agg, {'$group' => {'_id' => $group}});
-
-    log_debug("Aggregate clause is: " . Dumper(\@agg));
+    push(@agg, {'$group'  => {'_id'       => '$identifier',
+			      'max_start' => {'$max' => '$start'}}});
 
     my $results;
     eval {
 	$results = $self->mongo
 	    ->get_database($db_name)
-	    ->get_collection("measurements")
+	    ->get_collection('measurements')
 	    ->aggregate(\@agg);
     };
     if ($@){
-	log_warn("Error getting distinct identifiers: $@");
+	log_warn("Unable to fetch latest measurement entries for $db_name policy $name: $@");
 	return;
     }
 
+    my @ors;
+    foreach my $res (@$results){
+	push(@ors, {
+	    'identifier' => $res->{'_id'},
+	    'start'      => $res->{'max_start'}
+	     });
+    }
+
+    my $fields = {'identifier' => 1, 'values' => 1, 'start' => 1};
+    foreach my $req_field (@{$self->required_fields->{$db_name}}){
+	$fields->{$req_field} = 1;
+    }
+
+    my $cursor;
+    eval {
+	$cursor = $self->mongo
+	    ->get_database($db_name)
+	    ->get_collection('measurements')
+	    ->find({'$or' => \@ors})->fields($fields);
+    };
+
     # Convert to a hash for easier lookup later
     my %lookup;
-    foreach my $res (@$results){
-	die Dumper($res);
-	$lookup{$res->{'identifier'}} = $res;
+    while (my $doc = $cursor->next()){
+	$lookup{$doc->{'identifier'}} = $doc;
     }
 
     # Remember these identifiers so that we can reference them later
@@ -347,11 +412,11 @@ sub _find_previous_policies {
     # the identifier in another policy with the same interval we can skip it
     # here since we have already aggregated it   
     foreach my $policy (@sorted){
-	my $interval = $policy->{'interval'};	
-	next if ($interval > $current_interval);	
+	# skip ourselves
+	next if ($current_policy->{'name'} eq $policy->{'name'});
+	next if ($current_policy->{'interval'} > $current_interval);
 	push(@possible_matches, $policy);
     }
-
 
     foreach my $identifier (keys %$measurements){
 
@@ -388,6 +453,10 @@ sub _find_previous_policies {
 	$buckets{$chosen_interval}{$identifier} = $measurements->{$identifier};
     }
 
+    foreach my $interval (keys %buckets){
+	log_debug("Building " . scalar(keys %{$buckets{$interval}}) . " measurements for interval $current_interval from interval $interval");
+    }
+
     return \%buckets;
 }
 
@@ -404,6 +473,8 @@ sub _get_dirty_data {
 	'identifier' => {'$in' => \@ids}
     };
 
+    log_debug("Getting dirty docs since $last_run");
+
     my $col_name = "data";
     if ($interval && $interval > 1){
 	$col_name = "data_$interval";
@@ -411,11 +482,18 @@ sub _get_dirty_data {
 
     my $collection = $self->mongo->get_database($db_name)->get_collection($col_name);
 
+    my $fields = {
+	"updated_start" => 1,
+	"updated_end"   => 1,
+	"start"         => 1,
+	"end"           => 1,
+	"identifier"    => 1,
+	"_id"           => 1
+    };
+
     my $cursor;
     eval {
-	$cursor = $collection->find($query)->fields({"updated_start" => 1,
-						     "updated_end"   => 1,
-						     "identifier"    => 1});
+	$cursor = $collection->find($query)->fields($fields);
     };
 
     if ($@){
@@ -429,6 +507,44 @@ sub _get_dirty_data {
 	push(@docs, $doc);	
     }
 
+    log_debug("Found " . scalar(@docs) . " dirty docs, attempting to get locks");
+
+    # This part is a bit strange. We have to do a first fetch to figure out
+    # what all docs we're going to need to touch. Then we need to lock them
+    # all through Redis so that another process doesn't touch them while
+    # we're doing our thing. Then we need to fetch them again to ensure that
+    # the version in memory is the same as the one on disk
+    # We're also fetching them by _id the second time around to make sure
+    # we're only getting exactly the ones we have already locked. Any others
+    # will be picked up in a later run.
+    my @internal_ids;
+    my @locks;
+    foreach my $doc (@docs){
+	my $key  = $self->_get_cache_key($db_name, $col_name, $doc);
+	my $lock = $self->locker->lock($key, 60);
+	push(@internal_ids, $doc->{'_id'});
+	push(@locks, $lock);
+    }
+
+    # Store all of the locks we need to release later
+    $self->_set_locks(\@locks);
+
+    # Now that they're all locked, fetch them again
+    eval {	
+	$cursor = $collection->find({_id => {'$in' => \@internal_ids}})->fields($fields);
+    };
+    if ($@){
+	log_warn("Unable to find dirty documents on fetch 2: $@");
+	return;
+    }
+
+    undef @docs;
+    while (my $doc = $cursor->next()){
+	push(@docs, $doc);
+    }
+
+    log_debug("Found " . scalar(@docs) . " final dirty docs");
+
     return \@docs;
 }
 
@@ -441,6 +557,7 @@ sub _generate_work {
     my $interval_to    = $args{'interval_to'};
     my $docs           = $args{'docs'};
     my $measurements   = $args{'measurements'};
+    my $policy         = $args{'policy'};
 
     my @messages;
 
@@ -452,6 +569,8 @@ sub _generate_work {
     # serviceable in the same query
 
     my %grouped;
+
+    my @doc_ids;
 
     foreach my $doc (@$docs){
 	my $updated_start = $doc->{'updated_start'};
@@ -466,6 +585,21 @@ sub _generate_work {
 	my $ceil  = int(ceil($updated_end / $interval_to)) * $interval_to;
 
 	push(@{$grouped{$floor}{$ceil}}, $doc);
+	push(@doc_ids, $doc->{'_id'});
+    }
+
+    my @final_values;
+    foreach my $value (@{$self->value_fields->{$db}}){
+	my $attributes = {
+	    name           => $value,
+	    hist_res       => undef,
+	    hist_min_width => undef
+	};
+	if (exists $policy->{'values'}{$value}){
+	    $attributes->{'hist_res'}       = $policy->{'values'}{$value}{'hist_res'};
+	    $attributes->{'hist_min_width'} = $policy->{'values'}{$value}{'hist_min_width'};
+	}
+	push(@final_values, $attributes);
     }
 
     # Now that we have grouped the messages based on their timeframes
@@ -482,9 +616,10 @@ sub _generate_work {
 		interval_from  => $interval_from,
 		interval_to    => $interval_to,
 		start          => $start,
-		end            => $end,	    
+		end            => $end,
 		meta           => [],
-		values         => $self->values->{$db}
+		required_meta  => $self->required_fields->{$db},
+		values         => \@final_values		
 	    };
 
 	    # Add the meta fields to our message identifying
@@ -492,25 +627,70 @@ sub _generate_work {
 	    foreach my $doc (@$grouped_docs){
 
 		my $measurement = $measurements->{$doc->{'identifier'}};
-		my $meta = {};
-		foreach my $field (keys %$measurement){
-		    $meta->{$field} = $measurement->{$field};
-		    push(@{$message->{'meta'}}, $meta);
+		my @meas_values;
+		my %meas_fields;
+
+		# Add the min/max for values if present
+		if (exists $measurement->{'values'}){
+		    foreach my $value_name (keys %{$measurement->{'values'}}){
+			push(@meas_values, {
+			    'name' => $value_name,
+			    'min'  => $measurement->{'values'}{$value_name}{'min'},
+			    'max'  => $measurement->{'values'}{$value_name}{'max'}
+			});
+		    }
 		}
+
+		# Add the meta required fields
+		foreach my $req_field (@{$self->required_fields->{$db}}){
+		    $meas_fields{$req_field} = $measurement->{$req_field};
+		}
+
+		my $meta = {
+		    values => \@meas_values,
+		    fields => \%meas_fields
+		};
+
+		push(@{$message->{'meta'}}, $meta);
 
 		# Avoid making messages too big, chunk them up
 		if (@{$message->{'meta'}} >= 50){
-		    $self->rabbit->publish(1, $self->rabbit_queue, encode_json($message), {'exchange' => ''});
+		    $self->rabbit->publish(1, $self->rabbit_queue, encode_json([$message]), {'exchange' => ''});
 		    $message->{'meta'} = [];
 		}
 	    }
 
 	    # Any leftover tasks, send that too
-	    if (@{$message->{'meta'}} >= 1){
-		$self->rabbit->publish(1, $self->rabbit_queue, encode_json($message), {'exchange' => ''});
+	    if (@{$message->{'meta'}} > 0){
+		$self->rabbit->publish(1, $self->rabbit_queue, encode_json([$message]), {'exchange' => ''});
 	    }
 	}    
     }
+
+    # Now that we have generated all of the messages, we can go through and clear the flags 
+    # on each of these data documents
+    my $col_name = "data";
+    if ($interval_from > 1){
+	$col_name = "data_$interval_from";
+    }   
+    my $collection = $self->mongo->get_database($db)->get_collection($col_name);
+
+    log_debug("Clearing updated flags for impacted docs in $db $col_name");
+
+    eval {	
+	$collection->update({_id => {'$in' => \@doc_ids}},
+			    {'$unset' => {'updated'       => 1,
+					  'updated_start' => 1,
+					  'updated_end'   => 1}},
+			    {multiple => 1});
+    };
+    if ($@){
+	log_warn("Unable to clear updated flags on data docs: $@");
+	return;
+    }
+
+    # We can go ahead and let go of all of our locks now
+    $self->_release_locks();
 
     return 1;
 }
@@ -524,9 +704,6 @@ sub _get_aggregate_policies {
     my %policies;
 
     foreach my $db_name (@db_names){
-
-	# TEMPORARY HACK FOR TESTING
-	next unless ($db_name eq 'interface');
 
         my $cursor;
 	my @docs;
@@ -620,6 +797,54 @@ sub _rabbit_connect {
     $self->_set_rabbit($rabbit);
 
     log_debug("Connected");
+
+    return 1;
+}
+
+sub _redis_connect {
+    my ( $self ) = @_;
+
+    my $redis_host = $self->config->get( '/config/master/redis/host' );
+    my $redis_port = $self->config->get( '/config/master/redis/port' );
+
+    log_debug("Connecting to redis on $redis_host:$redis_port");
+
+    my $redis = Redis->new( server => "$redis_host:$redis_port" );
+
+    my $locker = Redis::DistLock->new( servers => [$redis],
+                                       retry_count => 10 );
+
+    $self->_set_locker( $locker );
+
+    log_debug("Connected");
+
+    return 1;
+}
+
+# Given a database name, collection name, and a data document
+# generates the Redis lock cache key in the same manner as the writer
+# process to help them coordinate
+sub _get_cache_key {
+    my ( $self, $db, $col, $doc ) = @_;
+
+    my $key = "lock__" . $db . "__" . $col;
+    $key .=  "__" . $doc->{'identifier'};
+    $key .=  "__" . $doc->{'start'};
+    $key .=  "__" . $doc->{'end'};
+
+    return $key;
+}
+
+sub _release_locks {
+    my ( $self ) = @_;
+
+    log_debug("Releasing " . scalar(@{$self->locks}) . " locks");
+
+    foreach my $lock (@{$self->locks}){
+	$self->locker->release($lock);
+    }
+
+    $self->_set_locks([]);
 
     return 1;
 }
