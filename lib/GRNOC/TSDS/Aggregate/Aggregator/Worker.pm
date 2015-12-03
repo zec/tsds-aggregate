@@ -4,6 +4,7 @@ use Moo;
 
 use GRNOC::WebService::Client;
 use GRNOC::TSDS::Aggregate::Aggregator::Message;
+use GRNOC::TSDS::Aggregate::Histogram;
 
 use Net::AMQP::RabbitMQ;
 use JSON::XS;
@@ -279,7 +280,7 @@ sub _consume_messages {
 	my $aggregate_message;
 
 	try {
-	    
+
 	    $aggregate_message = GRNOC::TSDS::Aggregate::Aggregator::Message->new( type => $type,
 										   interval_from => $interval_from,
 										   interval_to => $interval_to,
@@ -312,13 +313,15 @@ sub _consume_messages {
         $self->logger->error( "Error aggregating messages: $_" );
         $success = 0;
     };
-    
+
     return $success;
 }
 
 sub _aggregate_messages {
 
     my ( $self, $messages ) = @_;
+
+    my $finished_messages = [];
 
     foreach my $message ( @$messages ) {
 
@@ -331,16 +334,18 @@ sub _aggregate_messages {
 	my $values = $message->values;
 	my $required_meta = $message->required_meta;
 
+	my $min_max_mappings = $self->_get_min_max_mappings( required_meta => $required_meta,
+							     meta => $meta );
+
+	my $hist_mappings = $self->_get_histogram_mappings( $values );
+
 	# craft the query needed to fetch the data from the necessary interval
 	my $from_clause = "from $type";
-	my $values_clause = $self->_get_values_clause( from => $from, values => $values );
+	my $values_clause = $self->_get_values_clause( from => $from, values => $values, required_meta => $required_meta );
 	my $between_clause = $self->_get_between_clause( start => $start, end => $end, from => $from );
 	my $where_clause = $self->_get_where_clause( $meta );
 	my $by_clause = $self->_get_by_clause( $required_meta );
-
 	my $query = "$values_clause $between_clause $by_clause $from_clause $where_clause";
-
-	warn $query;
 
 	# issue the query to the webservice to retrieve the data we need to aggregate
 	my $results = $self->websvc->query( query => $query );
@@ -360,9 +365,190 @@ sub _aggregate_messages {
 
 	foreach my $result ( @$results ) {
 
-	    warn Dumper $result;
+	    my $aggregated = $self->_aggregate( doc => $result,
+						required_meta => $required_meta,
+						hist_mappings => $hist_mappings,
+						hist_min_max_mappings => $min_max_mappings );
+
+	    warn Dumper $aggregated;
+	    die Dumper $aggregated;
 	}
     }
+}
+
+sub _aggregate {
+
+    my ( $self, %args ) = @_;
+
+    my $doc = $args{'doc'};
+    my $required_meta = $args{'required_meta'};
+    my $hist_mappings = $args{'hist_mappings'};
+    my $hist_min_max_mappings = $args{'hist_min_max_mappings'};
+
+    my $result = {};
+
+    my @value_types = keys( %$doc );
+
+    # the required fields are not one of the possible value types
+    foreach my $required ( @$required_meta ) {
+
+	@value_types = grep { $_ ne $required } @value_types;
+    }
+
+    foreach my $value_type ( @value_types ) {
+
+	my $min;
+	my $max;
+	my $sum;
+	my $count;
+	my $avg;
+	my $hist;
+
+	# figure out the smallest/largest possible min/max to use for the histogram
+	my @key_fields;
+
+	foreach my $required_meta ( @$required_meta ) {
+
+	    push( @key_fields, $doc->{$required_meta} );
+	}
+
+	my $key = join( '__', ( @key_fields, $value_type ) );
+
+	my $hist_min = $hist_min_max_mappings->{$key}{'min'};
+	my $hist_max = $hist_min_max_mappings->{$key}{'max'};
+
+	my $hist_res = $hist_mappings->{$value_type}{'hist_res'};
+	my $hist_min_width = $hist_mappings->{$value_type}{'hist_min_width'};
+
+        # handle every value in this type
+	my $entries = $doc->{$value_type};
+
+	foreach my $entry ( @$entries ) {
+
+	    my ( $timestamp, $value ) = @$entry;
+
+            # initialize total count, sum, min, max if needed
+	    $count = 0 if ( !defined( $count ) );
+	    $sum = 0 if ( !defined( $sum ) );
+
+	    $min = $value if ( !defined( $min ) );
+	    $max = $value if ( !defined( $max ) );
+
+            # determine new sum for our average calculation
+	    $sum += $value if ( defined $value );
+
+	    $count++ if ( defined $value );
+
+            # determine if there is a new min/max
+	    $min = $value if ( defined( $value ) && $value < $min );
+	    $max = $value if ( defined( $value ) && $value > $max );
+	}
+
+        # we have the min, max, and sum, but we also need the mean/avg
+	$avg = $sum / $count if $count;
+
+        # generate our percentile histogram between min => max
+	if ( defined( $min ) && defined( $max ) && $min != $max ) {
+
+	    if ( $hist_res && $hist_min_width ) {
+
+                $hist = GRNOC::TSDS::Aggregate::Histogram->new( hist_min => $hist_min,
+                                                                hist_max => $hist_max,
+                                                                data_min => $min,
+                                                                data_max => $max,
+                                                                min_width => $hist_min_width,
+                                                                resolution => $hist_res );
+	    }
+
+	    if ( defined( $hist ) ) {
+
+		my @values;
+
+                # add every value into our histogram
+		foreach my $entry ( @$entries ) {
+
+		    my ( $timestamp, $value ) = @$entry;
+
+		    push( @values, $value );
+		}
+
+		$hist->add_values( \@values );
+
+		$hist = {'total' => $hist->total,
+                         'bin_size' => $hist->bin_size,
+                         'num_bins' => $hist->num_bins,
+                         'min' => $hist->hist_min,
+                         'max' => $hist->hist_max,
+			 'bins' => $hist->bins};
+	    }
+	}
+
+        # all done handling the aggregation of this data type
+	$result->{$value_type} = {'min' => $min,
+				  'max' => $max,
+				  'avg' => $avg,
+				  'hist' => $hist};
+    }
+
+    warn "Meowmroewmroewm";
+
+    return $result;
+}
+
+sub _get_histogram_mappings {
+
+    my ( $self, $values ) = @_;
+
+    my $mappings = {};
+
+    foreach my $value ( @$values ) {
+
+	my $name = $value->{'name'};
+	my $hist_res = $value->{'hist_res'};
+	my $hist_min_width = $value->{'hist_min_width'};
+
+	$mappings->{$name}{'hist_res'} = $hist_res;
+	$mappings->{$name}{'hist_min_width'} = $hist_min_width;
+    }
+
+    return $mappings;
+}
+
+sub _get_min_max_mappings {
+
+    my ( $self, %args ) = @_;
+
+    my $required_meta = $args{'required_meta'};
+    my $meta = $args{'meta'};
+
+    my $mappings = {};
+
+    foreach my $entry ( @$meta ) {
+
+	my $fields = $entry->{'fields'};
+	my $values = $entry->{'values'};
+
+	my @key_fields;
+
+	foreach my $required_meta ( @$required_meta ) {
+	    
+	    push( @key_fields, $fields->{$required_meta} );
+	}
+
+	foreach my $value ( @$values ) {
+
+	    my $value_name = $value->{'name'};	    
+	    my $min = $value->{'min'};
+	    my $max = $value->{'max'};
+
+	    my $key = join( '__', ( @key_fields, $value_name ) );
+
+	    $mappings->{$key}{'min'} = $min;
+	    $mappings->{$key}{'max'} = $max;
+	}
+    }
+
+    return $mappings;
 }
 
 sub _get_values_clause {
@@ -371,13 +557,17 @@ sub _get_values_clause {
 
     my $from = $args{'from'};
     my $values = $args{'values'};
+    my $required_meta = $args{'required_meta'};
 
-    # convert each value to proper aggregation based upon the interval we are fetching the data from
-    my @values = map { "aggregate(values.$_, $from, average) as $_" } @$values;
+    # pull out all value names
+    my @value_names = map { $_->{'name'} } @$values;
+
+    # convert each value name to proper aggregation based upon the interval we are fetching the data from
+    my @values = map { "aggregate(values.$_, $from, average) as $_" } @value_names;
 
     # comma separate each
-    my $values_clause = "get " . join( ', ', @values );
-    
+    my $values_clause = "get " . join( ', ', @$required_meta, @values );
+
     return $values_clause;
 }
 
@@ -407,27 +597,29 @@ sub _get_by_clause {
 
 sub _get_where_clause {
 
-    my ( $self, $measurements ) = @_;
+    my ( $self, $meta ) = @_;
 
     my @or_clauses;
 
-    foreach my $measurement ( @$measurements ) {
+    foreach my $entry ( @$meta ) {
 
 	my @clause;
 
-	while ( my ( $key, $value ) = each( %$measurement ) ) {
+	my $fields = $entry->{'fields'};
+
+	while ( my ( $key, $value ) = each( %$fields ) ) {
 
 	    push( @clause, "$key = \"$value\"" );
 	}
-	
+
 	my $clause = '( ' . join( ' and ', @clause ) . ' )';
 
 	push( @or_clauses, $clause );
     }
-   
+
     my $where_clause = "where " . join( ' or ', @or_clauses );
 
-    return $where_clause;    
+    return $where_clause;
 }
 
 sub _rabbit_connect {
