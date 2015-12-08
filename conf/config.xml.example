@@ -42,7 +42,7 @@
 
   </master>
 
-  <!-- rabbitmq connection info, shared by workers and master -->
+  <!-- rabbitmq connection info -->
   <rabbit>
     <host>127.0.0.1</host>
     <port>5672</port>
@@ -50,4 +50,12 @@
     <finished-queue>finished_aggregate</finished-queue>
   </rabbit>
 
+  <!-- tsds webservice connection info -->
+  <tsds>
+    <cloud>GlobalNOC</cloud>
+    <username>username</username>
+    <password>password</password>
+    <realm>realm</realm>
+  </tsds>
+  
 </config>

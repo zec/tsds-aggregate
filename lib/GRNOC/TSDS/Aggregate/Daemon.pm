@@ -14,6 +14,7 @@ use Proc::Daemon;
 
 use POSIX;
 use Data::Dumper;
+use List::MoreUtils qw(natatime);
 
 use MongoDB;
 
@@ -23,7 +24,15 @@ use JSON::XS;
 use Redis;
 use Redis::DistLock;
 
+use Storable qw(dclone);
+
+use Time::HiRes qw(tv_interval gettimeofday);
+
 extends 'GRNOC::TSDS::Aggregate';
+
+use constant LOCK_TIME => 120;
+use constant MESSAGE_SIZE => 50;
+use constant MEASUREMENTS_PER_TICK => 10000;
 
 ### private attributes ###
 
@@ -69,7 +78,7 @@ sub start {
 
         log_debug( 'Daemonizing.' );
 
-        my $daemon = Proc::Daemon->new( pid_file => $self->config->get( '/config/pid-file' ) );
+        my $daemon = Proc::Daemon->new( pid_file => $self->config->get( '/config/master/pid-file' ) );
 
         my $pid = $daemon->Init();
 
@@ -88,11 +97,7 @@ sub start {
         log_debug( 'Running in foreground.' );
     }
 
-    $self->_mongo_connect() or return;
-
-    $self->_rabbit_connect() or return;
-
-    $self->_redis_connect() or return;
+    $self->_connect();
 
     $self->_work_loop();
 
@@ -111,9 +116,15 @@ sub _work_loop {
         $self->_set_now(time());
 
         # Find the databases that need workings
-        my $dbs = $self->_get_aggregate_policies();
+	my $dbs;
+	try {
+	    $dbs = $self->_get_aggregate_policies();
+	}
+	catch {
+	    log_warn("Unable to get aggregate policies: $_");
+	};
 
-        if ((keys %$dbs) == 0){
+        if (! defined $dbs || (keys %$dbs) == 0){
             log_info("No aggregate policies to work on, sleeping for 60s...");
             sleep(60);
             next;
@@ -125,20 +136,27 @@ sub _work_loop {
             my $policies = $dbs->{$db_name};
 
 	    my $next_run;
-
+	    my $failed = 0;
 	    try {
 		# Make sure we know the required fields for this database
 		my $success = $self->_get_metadata($db_name);
 		return if (! defined $success);
 		
 		$next_run = $self->_evaluate_policies($db_name, $policies);
-		next if (! defined $next_run);
+		return if (! defined $next_run);
 		
-		log_debug("Next run is $next_run for $db_name");
+		log_info("Next run is $next_run for $db_name (" . localtime($next_run) . ")");
 	    }
 	    catch {
 		log_warn("Caught exception while processing $db_name: $_");
+		$failed = 1;
 	    };
+	    
+	    # if we failed for whatever reason, reconnect to everything as a safety
+	    if ($failed){
+		log_info("Reconnecting to everything due to failure");
+		$self->_connect();		
+	    }
 
 	    # Possibly redundant release in case an exception happened above, want
 	    # to make sure we're not hanging on to things
@@ -158,7 +176,7 @@ sub _work_loop {
 	    $next_wake_time = time() + 60;
 	}
        
-        log_debug("Next wake time is $next_wake_time");
+        log_debug("Next wake time is $next_wake_time (" . localtime($next_wake_time) . ")");
 
 
         # Sleep until the next time we've determined we need to do something
@@ -167,8 +185,9 @@ sub _work_loop {
             log_info("Sleeping $delta seconds until next work");
             sleep($delta);
         }
+	# This shouldn't happen, means we're falling behind
         else {
-            log_debug("Not sleeping since delta <= 0");
+            log_warn("Not sleeping since delta <= 0, was $delta");
         }
     }
 }
@@ -190,11 +209,14 @@ sub _evaluate_policies {
 
     # Iterate over each policy to figure out what needs doing if anything
     foreach my $policy (@$policies){	
+
+	my $start = [gettimeofday];
+
 	my $interval = $policy->{'interval'};
 	my $name     = $policy->{'name'};
 	my $last_run = $policy->{'last_run'} || 0;
 
-	log_debug("Last run for $db_name $name was $last_run");
+	log_debug("Last run for $db_name $name was $last_run (" . localtime($last_run) . ")" );
 
 	my $next_run = $last_run + $interval;
 	
@@ -202,46 +224,67 @@ sub _evaluate_policies {
 	# order out to some worker and send it
 	if ($next_run <= $self->now()){
 
-	    # Get the set of measurements that apply to this policy
-	    my $measurements = $self->_get_measurements($db_name, $policy);
-	    next if (! $measurements);
+	    # Always need to get the set of measurements that apply to this policy
+	    # since later on we're assuming a policy higher up will be able to 
+	    # see what this policy will have touched
+	    my $all_measurements = $self->_get_measurements($db_name, $policy);
+	    next if (! $all_measurements);
 
-	    # Find the previous policy that applied to this measurement so we know
-	    # what dirty docs to check
-	    # This will also omit any measurements that were already applied to a same
-	    # interval but heavier weighted policy to avoid the redundancy. Later on we
-	    # only care about what interval was picked, not why it was picked.
-	    my $work_buckets = $self->_find_previous_policies(db           => $db_name,
-							      current      => $policy,
-							      policies     => $policies,
-							      measurements => $measurements);
+	    # Chunk doing the measurements so that we're not blocking everything
+	    my $iterator = natatime(MEASUREMENTS_PER_TICK, keys %$all_measurements);
 
+	    my $total_chunks  = ceil(scalar(keys %$all_measurements) / MEASUREMENTS_PER_TICK);
+	    my $current_chunk = 0;
+	    while (my @identifiers = $iterator->() ){
 
-	    # Figure out from those measurements which have data that needs
-	    # aggregation into this policy
-	    foreach my $prev_interval (keys %$work_buckets){
-		log_debug("Processing data from $prev_interval");
+		$current_chunk++;
+		log_debug("Chunk $current_chunk / $total_chunks");
 
-		my $interval_measurements = $work_buckets->{$prev_interval};
+		# build up our chunk of measurements from all measurements
+		my $measurements = {};
+		foreach my $identifier (@identifiers){
+		    $measurements->{$identifier} = $all_measurements->{$identifier};
+		}
 
-		my $dirty_docs = $self->_get_dirty_data($db_name, $prev_interval, $last_run, $interval_measurements);
-		return if (! $dirty_docs);
-
-		# Create and send out rabbit messages describing work that
-		# needs doing
-		my $result = $self->_generate_work(policy        => $policy,
-						   db            => $db_name,
-						   interval_from => $prev_interval,
-						   interval_to   => $interval,
-						   docs          => $dirty_docs,
-						   measurements  => $interval_measurements);
-
-		if (! defined $result){
-		    log_warn("Error generating work for $db_name policy $name, skipping");
-		    return;
-		}		
+		# Find the previous policy that applied to this measurement so we know
+		# what dirty docs to check
+		# This will also omit any measurements that were already applied to a same
+		# interval but heavier weighted policy to avoid the redundancy. Later on we
+		# only care about what interval was picked, not why it was picked.
+		my $work_buckets = $self->_find_previous_policies(db           => $db_name,
+								  current      => $policy,
+								  policies     => $policies,
+								  measurements => $measurements);
+		
+		
+		# Figure out from those measurements which have data that needs
+		# aggregation into this policy
+		foreach my $prev_interval (keys %$work_buckets){
+		    log_debug("Processing data from $prev_interval");
+		    
+		    my $interval_measurements = $work_buckets->{$prev_interval};
+		    
+		    my $dirty_docs = $self->_get_dirty_data(db           => $db_name,
+							    interval     => $prev_interval,
+							    last_run     => $last_run,
+							    measurements => $interval_measurements);
+		    return if (! $dirty_docs);
+		    
+		    # Create and send out rabbit messages describing work that
+		    # needs doing
+		    my $result = $self->_generate_work(policy        => $policy,
+						       db            => $db_name,
+						       interval_from => $prev_interval,
+						       interval_to   => $interval,
+						       docs          => $dirty_docs,
+						       measurements  => $interval_measurements);
+		    
+		    if (! defined $result){
+			log_warn("Error generating work for $db_name policy $name, skipping");
+			return;
+		    }		
+		}
 	    }
-	    
 	    # Update the aggregate to show the last time we successfully 
 	    # generated work for this
 	    
@@ -259,6 +302,8 @@ sub _evaluate_policies {
 
 	# Figure out the nearest next run time
 	$lowest_next_run = $next_run if (! defined $lowest_next_run || $next_run < $lowest_next_run);
+
+	log_info("Policy $db_name $name evaluated in " . tv_interval($start, [gettimeofday]) . " seconds");
     }
     
     return $lowest_next_run;
@@ -312,6 +357,7 @@ sub _get_metadata {
     return 1;
 }
 
+# Finds all measurements that apply to a given aggregation policy
 sub _get_measurements {
     my ( $self, $db_name, $policy ) = @_;
 
@@ -319,68 +365,133 @@ sub _get_measurements {
     my $interval = $policy->{'interval'};
     my $name     = $policy->{'name'};
 
+    my $start = [gettimeofday];
+
     my $obj;
-    eval {
-	$obj = JSON::XS::decode_json($meta);
-    };
+    eval { $obj = JSON::XS::decode_json($meta);  };
     if ($@){
 	log_warn("Unable to decode \"$meta\" as JSON in $db_name policy $name: $@");
 	return;
     }
 
-    # Build up the query we need to aggregate
-    my @agg;
+    log_debug("Fetching from $db_name.measurements where " . Dumper($obj));
 
-    # Hm this isn't technically accurate, we might need to do multiple passes
-    # once we find the data to figure out if the metadata at the time matched
-    push(@agg, {'$match' => $obj});
-    push(@agg, {'$group'  => {'_id'       => '$identifier',
-			      'max_start' => {'$max' => '$start'}}});
-
-    my $results;
+    # Step 1 is to get a distinct set of identifiers that this query
+    # matches so that we can iterate over them and get their most recent
+    # entry
+    my $distinct;
     eval {
-	$results = $self->mongo
+	$distinct = $self->mongo
 	    ->get_database($db_name)
-	    ->get_collection('measurements')
-	    ->aggregate(\@agg);
+	    ->run_command([distinct => "measurements",
+			   key      => "identifier",
+			   query    => $obj]);
     };
-    if ($@){
-	log_warn("Unable to fetch latest measurement entries for $db_name policy $name: $@");
+    if ($@ || ! $distinct->{'ok'}){
+	log_warn("Unable to find distint identifiers for $db_name policy $name: $@");
 	return;
     }
 
-    my @ors;
-    foreach my $res (@$results){
-	push(@ors, {
-	    'identifier' => $res->{'_id'},
-	    'start'      => $res->{'max_start'}
-	     });
-    }
+    $distinct = $distinct->{'values'};
 
-    my $fields = {'identifier' => 1, 'values' => 1, 'start' => 1};
-    foreach my $req_field (@{$self->required_fields->{$db_name}}){
-	$fields->{$req_field} = 1;
-    }
+    log_debug("Found " . scalar(@$distinct) . " distinct identifiers for $db_name policy $name");
 
-    my $cursor;
-    eval {
-	$cursor = $self->mongo
-	    ->get_database($db_name)
-	    ->get_collection('measurements')
-	    ->find({'$or' => \@ors})->fields($fields);
-    };
-
-    # Convert to a hash for easier lookup later
     my %lookup;
-    while (my $doc = $cursor->next()){
-	$lookup{$doc->{'identifier'}} = $doc;
+
+    # Optimization here - if we've already looked this measurement up on this run
+    # because of another policy we can skip doing some of the work below
+    my @missing;
+    foreach my $identifier (@$distinct){
+	my $found = 0;
+	foreach my $cache_name (keys %{$self->identifiers()}){
+	    next if ($cache_name eq ($db_name . $name)); # don't look at ourselves for a cache
+	    next unless ($cache_name =~ /^$db_name/); # make sure it's the same type
+	    my $cache = $self->identifiers()->{$cache_name};
+
+	    # Aha, we found it. Clone it and store it here, much faster than
+	    # having to go to mongo;
+	    if (exists $cache->{$identifier}){
+		$lookup{$identifier} = dclone($cache->{$identifier});
+		$found = 1;
+		last;
+	    }
+	}
+	push(@missing, $identifier) if (! $found);
+    }
+
+    log_debug("Foud previous cache hits for " .  (scalar(@$distinct) - scalar(@missing)) . " of " . scalar(@$distinct) . " identifiers");
+
+    # For anything else that we hadn't already seen we're going to look it up
+    # below
+    my $iterator = natatime(MEASUREMENTS_PER_TICK, @missing);
+
+    while (my @identifiers = $iterator->() ){
+	
+	# Build up the query we need to aggregate
+	my @agg;
+	
+	# Hm this isn't technically accurate, we might need to do multiple passes
+	# once we find the data to figure out if the metadata at the time matched
+	# For now this finds the most recent version of the identifier
+	push(@agg, {'$match' => {'identifier' => {'$in' => \@identifiers}}});
+	push(@agg, {'$group' => {'_id'       => '$identifier', 
+				 'max_start' => {'$max' => '$start'}}});
+	
+
+	my $cursor;
+	eval {
+	    $cursor = $self->mongo
+		->get_database($db_name)
+		->get_collection('measurements')
+		->aggregate(\@agg, {cursor => 1});
+	};
+	if ($@){
+	    log_warn("Unable to fetch latest measurement entries for $db_name policy $name: $@");
+	    return;
+	}
+		
+	my @identifiers;
+	my @starts;
+	my $count = 0;
+	while (my $doc = $cursor->next()){
+	    push(@identifiers, $doc->{'_id'});
+	    push(@starts, $doc->{'max_start'});
+	}
+
+	log_debug("Got " . scalar(@identifiers) . " back from agg clause");
+	
+	# Make sure we get the right set of fields to query
+	my $fields = {'identifier' => 1, 'values' => 1, 'start' => 1};
+	foreach my $req_field (@{$self->required_fields->{$db_name}}){
+	    $fields->{$req_field} = 1;
+	}
+	
+	# Okay, ready to grab the entries now. This is pretty annoying as a 3rd pass
+	# but we needed more fields than we could grab in the aggregation pipeline
+	eval {
+	    $cursor = $self->mongo
+		->get_database($db_name)
+		->get_collection('measurements')
+		->find({'identifier' => {'$in' => \@identifiers},
+			'start'      => {'$in' => \@starts}})->fields($fields);
+	};
+	if ($@){
+	    log_warn("Unable to execute latest measurement entries query with fields for $db_name policy $name: $@");
+	    return;
+	}
+    	
+	# Store these results
+	while (my $doc = $cursor->next()){
+	    $lookup{$doc->{'identifier'}} = $doc;
+	}
     }
 
     # Remember these identifiers so that we can reference them later
-    # when figuring out the nearest policy
     $self->identifiers->{$db_name . $name} = \%lookup;
 
-    log_debug("Found " . scalar(keys %lookup) . " measurements for $db_name policy $name");
+    my $duration = tv_interval($start, [gettimeofday]);
+
+    log_info("Found " . scalar(keys %lookup) . " measurements for $db_name policy $name in $duration seconds");
 
     return \%lookup;
 }
@@ -414,7 +525,7 @@ sub _find_previous_policies {
     foreach my $policy (@sorted){
 	# skip ourselves
 	next if ($current_policy->{'name'} eq $policy->{'name'});
-	next if ($current_policy->{'interval'} > $current_interval);
+	next if ($policy->{'interval'} > $current_interval);
 	push(@possible_matches, $policy);
     }
 
@@ -454,7 +565,14 @@ sub _find_previous_policies {
     }
 
     foreach my $interval (keys %buckets){
-	log_debug("Building " . scalar(keys %{$buckets{$interval}}) . " measurements for interval $current_interval from interval $interval");
+	log_info("Building " . scalar(keys %{$buckets{$interval}}) . " measurements for interval $current_interval from interval $interval");
+
+	# Should never hit this but an easy sanity check. We can never build say a 1 hour
+	# aggregate from a 1 day so if something above fails here's our last check
+	if ($current_interval < $interval){
+	    log_warn("Internal error - calculated bad prior interval. Aborting.");
+	    return;
+	}
     }
 
     return \%buckets;
@@ -464,7 +582,14 @@ sub _find_previous_policies {
 # what data documents for that interval have been updated since the timestamp.
 # This returns all those documents
 sub _get_dirty_data {
-    my ( $self, $db_name, $interval, $last_run, $measurements ) = @_;
+    my ( $self, %args ) = @_;
+
+    my $start = [gettimeofday];
+
+    my $db_name      = $args{'db'};
+    my $interval     = $args{'interval'};
+    my $last_run     = $args{'last_run'};
+    my $measurements = $args{'measurements'};
 
     my @ids = keys %$measurements;
 
@@ -519,15 +644,35 @@ sub _get_dirty_data {
     # will be picked up in a later run.
     my @internal_ids;
     my @locks;
+    my %meow;
     foreach my $doc (@docs){
+
+	if (exists $meow{$doc->{'_id'}}){
+	    warn "DUPLICATE:" . Dumper($doc);
+	    warn "ORIGINAL:" . Dumper($meow{$doc->{'_id'}});
+	    next;
+	}
+
 	my $key  = $self->_get_cache_key($db_name, $col_name, $doc);
-	my $lock = $self->locker->lock($key, 60);
+	my $lock = $self->locker->lock($key, LOCK_TIME);
+
+	if (! $lock){
+	    log_warn("Could not get a lock on key $key, skipping it for this run");
+	    next;
+	}
+
 	push(@internal_ids, $doc->{'_id'});
+
+	$meow{$doc->{'_id'}} = $doc;
 	push(@locks, $lock);
     }
 
     # Store all of the locks we need to release later
     $self->_set_locks(\@locks);
+
+    log_debug("Internal IDs size is " . scalar(@internal_ids));
+
+    log_debug("Sizeof meow is " . scalar(keys %meow));
 
     # Now that they're all locked, fetch them again
     eval {	
@@ -538,14 +683,19 @@ sub _get_dirty_data {
 	return;
     }
 
-    undef @docs;
+    my @final_docs;
     while (my $doc = $cursor->next()){
-	push(@docs, $doc);
-    }
+	delete $meow{$doc->{'_id'}};
+	push(@final_docs, $doc);
+    }   
 
-    log_debug("Found " . scalar(@docs) . " final dirty docs");
+    warn "LEFTOVER IS " . Dumper(\%meow);
 
-    return \@docs;
+    my $duration = tv_interval($start, [gettimeofday]);
+
+    log_info("Found " . scalar(@final_docs) . " final dirty docs to work on in $duration seconds");
+
+    return \@final_docs;
 }
 
 # Formulate and send a message out to a worker
@@ -572,10 +722,30 @@ sub _generate_work {
 
     my @doc_ids;
 
+    my $start = [gettimeofday];
+
     foreach my $doc (@$docs){
+	my $doc_start     = $doc->{'start'};
+	my $doc_end       = $doc->{'end'};
 	my $updated_start = $doc->{'updated_start'};
 	my $updated_end   = $doc->{'updated_end'};
 	my $identifier    = $doc->{'identifier'};
+
+	if (! defined $updated_end || ! defined $updated_start){
+	    log_warn("Doc is missing updated_end and/or updated_start, using full doc length");
+	    $updated_start = $doc_start if (! defined $updated_start);
+	    $updated_end = $doc_end if (! defined $updated_end);
+	}
+
+	# This shouldn't be possible 
+	if ($updated_end > $doc_end){
+	    log_warn("Doc had an updated_end > doc_end ($updated_end vs $doc_end), using doc_end");
+	    $updated_end = $doc_end;
+	}
+	if ($updated_start < $doc_start){
+	    log_warn("Doc had an updated_start < doc_start ($updated_start vs $doc_start), using doc_start");
+	    $updated_start = $doc_start;
+	}
 
 	# We want to floor/ceil to find the actual timerange affected in the
 	# interval in this doc. ie we might have only touched data within one
@@ -609,7 +779,7 @@ sub _generate_work {
 
 	    my $grouped_docs = $grouped{$start}{$end};
 
-	    log_debug("Sending messages for $start - $end, interval_from = $interval_from interval_to = $interval_to, total grouped measurements = " . scalar(@$grouped_docs));
+	    log_info("Sending messages for $start - $end, interval_from = $interval_from interval_to = $interval_to, total grouped measurements = " . scalar(@$grouped_docs));
 
 	    my $message = {            
 		type           => $db,
@@ -623,7 +793,7 @@ sub _generate_work {
 	    };
 
 	    # Add the meta fields to our message identifying
-	    # this measurement
+	    # these measurements
 	    foreach my $doc (@$grouped_docs){
 
 		my $measurement = $measurements->{$doc->{'identifier'}};
@@ -654,7 +824,7 @@ sub _generate_work {
 		push(@{$message->{'meta'}}, $meta);
 
 		# Avoid making messages too big, chunk them up
-		if (@{$message->{'meta'}} >= 50){
+		if (@{$message->{'meta'}} >= MESSAGE_SIZE){
 		    $self->rabbit->publish(1, $self->rabbit_queue, encode_json([$message]), {'exchange' => ''});
 		    $message->{'meta'} = [];
 		}
@@ -666,6 +836,12 @@ sub _generate_work {
 	    }
 	}    
     }
+
+    my $duration = tv_interval($start, [gettimeofday]);
+
+    log_info("All work messages sent to rabbit in $duration seconds");
+
+    $start = [gettimeofday];
 
     # Now that we have generated all of the messages, we can go through and clear the flags 
     # on each of these data documents
@@ -688,6 +864,9 @@ sub _generate_work {
 	log_warn("Unable to clear updated flags on data docs: $@");
 	return;
     }
+
+    $duration = tv_interval($start, [gettimeofday]);
+    log_info("Cleared updated flags in $duration seconds");
 
     # We can go ahead and let go of all of our locks now
     $self->_release_locks();
@@ -731,7 +910,7 @@ sub _get_aggregate_policies {
 	    next;
 	}
 
-	$policies{$db_name} = \@docs;
+ 	$policies{$db_name} = \@docs;
     }
 
     log_debug("Found aggregate policies: " . Dumper(\%policies));
@@ -739,6 +918,15 @@ sub _get_aggregate_policies {
     return \%policies;
 }
 
+sub _connect {
+    my ( $self) = @_;
+
+    $self->_mongo_connect() or return;
+    $self->_rabbit_connect() or return;
+    $self->_redis_connect() or return;
+
+    return 1;
+}
 
 sub _mongo_connect {
     my ( $self ) = @_;
@@ -812,7 +1000,8 @@ sub _redis_connect {
     my $redis = Redis->new( server => "$redis_host:$redis_port" );
 
     my $locker = Redis::DistLock->new( servers => [$redis],
-                                       retry_count => 10 );
+                                       retry_count => 20,
+				       retry_delay => 0.5);
 
     $self->_set_locker( $locker );
 

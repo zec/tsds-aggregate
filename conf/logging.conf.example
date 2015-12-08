@@ -1,5 +1,4 @@
 log4perl.rootLogger = INFO, SYSLOG
-
 log4perl.appender.SYSLOG = Log::Dispatch::Syslog
 log4perl.appender.SYSLOG.min_level = info
 log4perl.appender.SYSLOG.ident = TSDS-AGGREGATE
