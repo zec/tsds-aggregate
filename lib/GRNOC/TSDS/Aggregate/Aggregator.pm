@@ -85,7 +85,7 @@ sub start {
 
         $self->logger->debug( 'Daemonizing.' );
 
-        my $daemon = Proc::Daemon->new( pid_file => $self->config->get( '/config/pid-file' ) );
+        my $daemon = Proc::Daemon->new( pid_file => $self->config->get( '/config/worker/pid-file' ) );
 
         my $pid = $daemon->Init();
 
@@ -141,7 +141,7 @@ sub _create_workers {
 
     my ( $self ) = @_;
 
-    my $num_processes = $self->config->get( '/config/num-processes' );
+    my $num_processes = $self->config->get( '/config/worker/num-processes' );
 
     $self->logger->info( "Creating $num_processes child worker processes." );
 
