@@ -9,6 +9,7 @@ use GRNOC::TSDS::Aggregate::Histogram;
 use Net::AMQP::RabbitMQ;
 use JSON::XS;
 use Math::Round qw( nlowmult nhimult );
+use List::MoreUtils qw( natatime );
 use Try::Tiny;
 
 use Data::Dumper;
@@ -334,6 +335,10 @@ sub _aggregate_messages {
 	my $values = $message->values;
 	my $required_meta = $message->required_meta;
 
+	# align to aggregation window we're getting data for
+	$start = nlowmult( $to, $start );
+	$end = nhimult( $to, $end );
+
 	my $min_max_mappings = $self->_get_min_max_mappings( required_meta => $required_meta,
 							     meta => $meta );
 
@@ -342,7 +347,7 @@ sub _aggregate_messages {
 	# craft the query needed to fetch the data from the necessary interval
 	my $from_clause = "from $type";
 	my $values_clause = $self->_get_values_clause( from => $from, values => $values, required_meta => $required_meta );
-	my $between_clause = $self->_get_between_clause( start => $start, end => $end, from => $from );
+	my $between_clause = $self->_get_between_clause( start => $start, end => $end, to => $to );
 	my $where_clause = $self->_get_where_clause( $meta );
 	my $by_clause = $self->_get_by_clause( $required_meta );
 	my $query = "$values_clause $between_clause $by_clause $from_clause $where_clause";
@@ -363,16 +368,86 @@ sub _aggregate_messages {
 
 	$results = $results->{'results'};
 
+	my $buckets = {};
+	my $meta_info = {};
+
 	foreach my $result ( @$results ) {
 
-	    my $aggregated = $self->_aggregate( doc => $result,
-						required_meta => $required_meta,
-						hist_mappings => $hist_mappings,
-						hist_min_max_mappings => $min_max_mappings );
+	    my @value_types = keys( %$result );
+	    my $meta_data = {};
+	    my @meta_keys;
 
-	    warn Dumper $aggregated;
-	    die Dumper $aggregated;
+	    # the required fields are not one of the possible value types
+	    foreach my $required ( @$required_meta ) {
+
+		@value_types = grep { $_ ne $required } @value_types;
+		$meta_data->{$required} = $result->{$required};
+		push( @meta_keys, $result->{$required} );
+	    }
+
+	    my $key = join( '__', @meta_keys );
+	    $meta_info->{$key} = $meta_data;
+
+	    foreach my $value_type ( @value_types ) {
+
+		my $entries = $result->{$value_type};
+
+		foreach my $entry ( @$entries ) {
+
+		    my ( $timestamp, $value ) = @$entry;
+
+		    my $bucket = nlowmult( $to, $timestamp );
+
+		    $buckets->{$key}{$bucket}{$value_type} = [] if ( !defined( $buckets->{$key}{$bucket}{$value_type} ) );
+
+		    push( @{$buckets->{$key}{$bucket}{$value_type}}, $entry );
+		}
+	    }
 	}
+
+	# handle every measurement that was bucketed
+	my @keys = keys( %$buckets );
+
+	foreach my $key ( @keys ) {
+
+	    # grab meta data hash to pass for this measurement
+	    my $meta_data = $meta_info->{$key};
+
+	    # handle every bucketed timestamp for this measurement
+	    my @timestamps = keys( %{$buckets->{$key}} );
+
+	    foreach my $time ( @timestamps ) {
+
+		# all the data during this bucket to aggregate for this measurement
+		my $data = $buckets->{$key}{$time};
+
+		my $aggregated = $self->_aggregate( data => $data,
+						    required_meta => $required_meta,
+						    hist_mappings => $hist_mappings,
+						    hist_min_max_mappings => $min_max_mappings,
+						    key => $key );
+		
+		$aggregated->{'type'} = "$type.aggregate";
+		$aggregated->{'time'} = $time;
+		$aggregated->{'interval'} = $to;
+		$aggregated->{'meta'} = $meta_data;
+
+		push( @$finished_messages, $aggregated );
+	    }
+	}
+    }
+
+    my $num = @$finished_messages;
+    warn "NUM: $num";
+
+    # send a max of 100 messages at a time to rabbit
+    my $it = natatime( 100, @$finished_messages );
+
+    my $queue = $self->config->get( '/config/rabbit/finished-queue' );
+
+    while ( my @finished_messages = $it->() ) {
+
+	$self->rabbit->publish( FINISHED_QUEUE_CHANNEL, $queue, $self->json->encode( \@finished_messages ), {'exchange' => ''} );
     }
 }
 
@@ -380,20 +455,16 @@ sub _aggregate {
 
     my ( $self, %args ) = @_;
 
-    my $doc = $args{'doc'};
+    my $data = $args{'data'};
+
     my $required_meta = $args{'required_meta'};
     my $hist_mappings = $args{'hist_mappings'};
     my $hist_min_max_mappings = $args{'hist_min_max_mappings'};
+    my $key = $args{'key'};
 
     my $result = {};
 
-    my @value_types = keys( %$doc );
-
-    # the required fields are not one of the possible value types
-    foreach my $required ( @$required_meta ) {
-
-	@value_types = grep { $_ ne $required } @value_types;
-    }
+    my @value_types = keys( %$data );
 
     foreach my $value_type ( @value_types ) {
 
@@ -405,15 +476,6 @@ sub _aggregate {
 	my $hist;
 
 	# figure out the smallest/largest possible min/max to use for the histogram
-	my @key_fields;
-
-	foreach my $required_meta ( @$required_meta ) {
-
-	    push( @key_fields, $doc->{$required_meta} );
-	}
-
-	my $key = join( '__', ( @key_fields, $value_type ) );
-
 	my $hist_min = $hist_min_max_mappings->{$key}{'min'};
 	my $hist_max = $hist_min_max_mappings->{$key}{'max'};
 
@@ -421,7 +483,7 @@ sub _aggregate {
 	my $hist_min_width = $hist_mappings->{$value_type}{'hist_min_width'};
 
         # handle every value in this type
-	my $entries = $doc->{$value_type};
+	my $entries = $data->{$value_type};
 
 	foreach my $entry ( @$entries ) {
 
@@ -484,13 +546,11 @@ sub _aggregate {
 	}
 
         # all done handling the aggregation of this data type
-	$result->{$value_type} = {'min' => $min,
-				  'max' => $max,
-				  'avg' => $avg,
-				  'hist' => $hist};
+	$result->{'values'}{$value_type} = {'min' => $min,
+					    'max' => $max,
+					    'avg' => $avg,
+					    'hist' => $hist};
     }
-
-    warn "Meowmroewmroewm";
 
     return $result;
 }
@@ -577,11 +637,11 @@ sub _get_between_clause {
 
     my $start = $args{'start'};
     my $end = $args{'end'};
-    my $from = $args{'from'};
+    my $to = $args{'to'};
 
     # make sure we fetch all data within the from interval
-    $start = nlowmult( $from, $start );
-    $end = nhimult( $from, $end );
+    $start = nlowmult( $to, $start );
+    $end = nhimult( $to, $end );
 
     return "between ($start, $end)";
 }
