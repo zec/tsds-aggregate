@@ -75,14 +75,14 @@ sub start {
     $self->_set_json( $json );
 
     # create websvc object
-    my $websvc = GRNOC::WebService::Client->new( uid => $self->config->get( '/config/tsds/username' ),
-						 passwd => $self->config->get( '/config/tsds/password' ),
-						 realm => $self->config->get( '/config/tsds/realm' ),
+    my $websvc = GRNOC::WebService::Client->new( uid => $self->config->get( '/config/worker/tsds/username' ),
+						 passwd => $self->config->get( '/config/worker/tsds/password' ),
+						 realm => $self->config->get( '/config/worker/tsds/realm' ),
 						 service_cache_file => SERVICE_CACHE_FILE,
 						 cookieJar => COOKIES_FILE,
 						 usePost => 1 );
 
-    $websvc->set_service_identifier( 'urn:publicid:IDN+grnoc.iu.edu:' . $self->config->get( '/config/tsds/cloud' ) . ':TSDS:1:Query' );
+    $websvc->set_service_identifier( 'urn:publicid:IDN+grnoc.iu.edu:' . $self->config->get( '/config/worker/tsds/cloud' ) . ':TSDS:1:Query' );
 
     $self->_set_websvc( $websvc );
 
@@ -438,7 +438,6 @@ sub _aggregate_messages {
     }
 
     my $num = @$finished_messages;
-    warn "NUM: $num";
 
     # send a max of 100 messages at a time to rabbit
     my $it = natatime( 100, @$finished_messages );
