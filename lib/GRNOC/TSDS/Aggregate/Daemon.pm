@@ -32,7 +32,7 @@ extends 'GRNOC::TSDS::Aggregate';
 
 use constant LOCK_TIME => 120;
 use constant MESSAGE_SIZE => 50;
-use constant MEASUREMENTS_PER_TICK => 10000;
+use constant MEASUREMENTS_PER_TICK => 5000;
 
 ### private attributes ###
 
