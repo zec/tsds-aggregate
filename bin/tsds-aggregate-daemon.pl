@@ -12,16 +12,14 @@ use Data::Dumper;
 
 ### constants ###
 
-use constant DEFAULT_CONFIG_FILE => '/etc/grnoc/tsds-aggregate/config.xml';
-use constant DEFAULT_LOGGING_FILE => '/etc/grnoc/tsds-aggregate/logging.conf';
-use constant DEFAULT_LOCK_DIR => '/var/run/grnoc/tsds-aggregate/';
+use constant DEFAULT_CONFIG_FILE => '/etc/grnoc/tsds/aggregate/config.xml';
+use constant DEFAULT_LOGGING_FILE => '/etc/grnoc/tsds/aggregate/logging.conf';
 
 ### command line options ###
 
 my $help;
 my $config = DEFAULT_CONFIG_FILE;
 my $logging = DEFAULT_LOGGING_FILE;
-my $lock_dir = DEFAULT_LOCK_DIR;
 my $nofork;
 my $database;
 my $start;
@@ -32,8 +30,7 @@ my $query;
 # parse options from command line
 GetOptions( "help|h|?"    => \$help,
             "config=s"    => \$config,
-            "logging=s"   => \$logging,
-            "lock-dir=s"  => \$lock_dir,
+            "logging=s"   => \$logging,            
             "nofork"      => \$nofork,
 	    "database=s"  => \$database,
 	    "start=s"     => \$start,
@@ -74,7 +71,6 @@ if (defined $start){
 }
 
 my $aggregator = GRNOC::TSDS::Aggregate::Daemon->new(config_file     => $config,
-						     lock_dir        => $lock_dir,
 						     force_database  => $database,
 						     force_policy    => $policy,
 						     force_query     => $query,
