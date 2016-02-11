@@ -12,6 +12,10 @@ use Math::Round qw( nlowmult nhimult );
 use List::MoreUtils qw( natatime );
 use Try::Tiny;
 
+# Get access to encode/decode_bson
+use XSLoader;
+XSLoader::load("MongoDB");
+
 use Data::Dumper;
 
 ### constants ###
@@ -68,6 +72,7 @@ sub start {
 
         $self->logger->info( "Received SIG HUP." );
     };
+
 
     # create JSON object
     my $json = JSON::XS->new();
