@@ -353,13 +353,17 @@ sub _aggregate_messages {
 	my $query = "$values_clause $between_clause $by_clause $from_clause $where_clause";
 
 	# issue the query to the webservice to retrieve the data we need to aggregate
-	my $results = $self->websvc->query( query => $query );
+	$self->websvc->set_raw_output(1);
+	my $results = $self->websvc->query( query  => $query,
+					    output => 'bson');
 
 	# handle any errors attempting to query the webservice
 	if ( !$results ) {
 
 	    die( "Error querying TSDS web service: " . $self->websvc->get_error() );
 	}
+
+	$results = MongoDB::BSON::decode_bson($results);
 
 	if ( $results->{'error'} ) {
 
@@ -378,29 +382,46 @@ sub _aggregate_messages {
 	    my @meta_keys;
 
 	    # the required fields are not one of the possible value types
+	    # we're also going to omit anything that came back as a result of
+	    # aggregation
 	    foreach my $required ( @$required_meta ) {
 
-		@value_types = grep { $_ ne $required } @value_types;
+		@value_types = grep { $_ ne $required && $_ !~ /__(min|max|hist)$/ } @value_types;
 		$meta_data->{$required} = $result->{$required};
 		push( @meta_keys, $result->{$required} );
 	    }
 
 	    my $key = join( '__', @meta_keys );
 	    $meta_info->{$key} = $meta_data;
-
+	    
+	    # Put all of the data points into their respective floored
+	    # buckets
 	    foreach my $value_type ( @value_types ) {
 
-		my $entries = $result->{$value_type};
+		my $entries      = $result->{$value_type};
 
-		foreach my $entry ( @$entries ) {
+		# Figure this out once, makes it easier later in the code to
+		# refer to a consistent flag
+		my $is_aggregate = exists($result->{$value_type . "__max"}) ? 1 : 0;
+
+		my $entries_max  = $result->{$value_type . "__max"} || [];
+		my $entries_min  = $result->{$value_type . "__min"} || [];
+		my $entries_hist = $result->{$value_type . "__hist"} || [];
+
+		for (my $i = 0; $i < @$entries; $i++){
+		    my $entry = $entries->[$i];
 
 		    my ( $timestamp, $value ) = @$entry;
 
-		    my $bucket = nlowmult( $to, $timestamp );
+		    my $bucket = $to * int($timestamp / $to);
 
-		    $buckets->{$key}{$bucket}{$value_type} = [] if ( !defined( $buckets->{$key}{$bucket}{$value_type} ) );
-
-		    push( @{$buckets->{$key}{$bucket}{$value_type}}, $entry );
+		    push( @{$buckets->{$key}{$bucket}{$value_type}}, {is_aggregate => $is_aggregate,
+								      avg  => $value,
+								      min  => $entries_min->[$i][1],
+								      max  => $entries_max->[$i][1],
+								      hist => $entries_hist->[$i][1],
+								      timestamp => $timestamp}
+			);
 		}
 	    }
 	}
@@ -481,28 +502,44 @@ sub _aggregate {
 	my $hist_res = $hist_mappings->{$value_type}{'hist_res'};
 	my $hist_min_width = $hist_mappings->{$value_type}{'hist_min_width'};
 
-        # handle every value in this type
+       # handle every value in this type
 	my $entries = $data->{$value_type};
 
 	foreach my $entry ( @$entries ) {
 
-	    my ( $timestamp, $value ) = @$entry;
+	    #warn "VAL TYPE IS $value_type";
+	    #warn Dumper($entry);
+
+	    my $timestamp = $entry->{'timestamp'};
+
+	    # This will either be the raw hi-res value or the aggregate
+	    # average value depending on what sort of resolution we're using
+	    my $average_val = $entry->{'avg'};
 
             # initialize total count, sum, min, max if needed
 	    $count = 0 if ( !defined( $count ) );
 	    $sum = 0 if ( !defined( $sum ) );
 
-	    $min = $value if ( !defined( $min ) );
-	    $max = $value if ( !defined( $max ) );
+	    # none of the other stuff matters if this was undef
+	    next if (! defined $average_val);
+
+	    # These will only be present if we're dealing with
+	    # aggregate data. If min/max aren't available then
+	    # they're equivalent to the base value
+	    my $min_val  = $entry->{'is_aggregate'} ? $entry->{'min'} : $average_val;
+	    my $max_val  = $entry->{'is_aggregate'} ? $entry->{'max'} : $average_val;
+
+	    #warn "MAX VAL IS $max_val";
+	    #warn "MIN VAL IS $min_val";
 
             # determine new sum for our average calculation
-	    $sum += $value if ( defined $value );
+	    $sum += $average_val;
 
-	    $count++ if ( defined $value );
+	    $count++;
 
             # determine if there is a new min/max
-	    $min = $value if ( defined( $value ) && $value < $min );
-	    $max = $value if ( defined( $value ) && $value > $max );
+	    $min = $min_val if ( ! defined $min || $min_val < $min );
+	    $max = $max_val if ( ! defined $max ||  $max_val > $max );
 	}
 
         # we have the min, max, and sum, but we also need the mean/avg
@@ -528,9 +565,36 @@ sub _aggregate {
                 # add every value into our histogram
 		foreach my $entry ( @$entries ) {
 
-		    my ( $timestamp, $value ) = @$entry;
+		    # if there exists an existing histogram, we basically
+		    # need to merge these histograms together into the
+		    # total values
+		    if ($entry->{'is_aggregate'}){
 
-		    push( @values, $value );
+			$self->logger->debug("Combining histograms");
+
+			my $hist_val = $entry->{'hist'};
+
+			my $start    = $hist_val->{'min'};
+			my $bin_size = $hist_val->{'bin_size'};
+			my $bins     = $hist_val->{'bins'};
+
+			#warn("COMBINING HIST IS " . Dumper($hist));
+
+			# Take each previously calculated bin, figure out which
+			# value it's representing by doing the bin number * the bin_size
+			# and then add to this new histogram that value for each
+			# time it showed up in the original histogram
+			while ( my ($bin, $bin_count) = each(%$bins) ){
+			    for (my $i = 0; $i < $bin_count; $i++){
+				push(@values, $min + ($bin * $bin_size));
+			    }
+			}
+		    
+		    }
+		    # if it's just basic data then we can use the avg_value instead
+		    else {
+			push( @values, $entry->{'avg'});
+		    }
 		}
 
 		$hist->add_values( \@values );
@@ -549,6 +613,10 @@ sub _aggregate {
 					    'max' => $max,
 					    'avg' => $avg,
 					    'hist' => $hist};
+
+	#warn "VALUE TYPE IS $value_type";
+	#warn Dumper($result->{'values'}{$value_type});
+	#die if ($value_type =~ /^input$/);
     }
 
     return $result;
@@ -621,8 +689,18 @@ sub _get_values_clause {
     # pull out all value names
     my @value_names = map { $_->{'name'} } @$values;
 
+    my @values;
+    # if we're doing from hires, there's no need to invoke the extra overhead on the
+    # server to make it look at aggregate data
+    if ($from eq 1){
+	@values = map { "values.$_ as $_" } @value_names;	
+    }
     # convert each value name to proper aggregation based upon the interval we are fetching the data from
-    my @values = map { "aggregate(values.$_, $from, average) as $_" } @value_names;
+    # we need to fetch min, max, average, and the prior histogram so that we can
+    # compute the most accurate result
+    else {
+	@values = map { "aggregate(values.$_, $from, average) as $_, aggregate(values.$_, $from, max) as $_" . "__max, aggregate(values.$_, $from, min) as $_" . "__min, aggregate(values.$_, $from, histogram) as $_" . "__hist" } @value_names;	
+    }
 
     # comma separate each
     my $values_clause = "get " . join( ', ', @$required_meta, @values );

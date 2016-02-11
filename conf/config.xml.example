@@ -22,7 +22,16 @@
   <!-- information for the master process, only needs to be set up
        for the one machine running the master. One master per cloud! -->
   <master>
-    
+ 
+    <!-- how many measurements to process in a single batch -->
+    <num_concurrent_measurements>1000</num_concurrent_measurements>;
+
+    <!-- how many measurements to include in a single rabbit message -->
+    <num_messages>100</num_messages>
+
+    <!-- how long in seconds to hold redis locks (unlikely you should have to change this) -->
+    <lock_timeout>120</lock_timeout>
+   
     <!-- where should we write the aggregator master pid file to -->
     <pid-file>/var/run/tsds_aggregator_master.pid</pid-file>
 
