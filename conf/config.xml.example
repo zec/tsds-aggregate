@@ -58,13 +58,5 @@
     <pending-queue>pending_aggregate</pending-queue>
     <finished-queue>finished_aggregate</finished-queue>
   </rabbit>
-
-  <!-- tsds webservice connection info -->
-  <tsds>
-    <cloud>GlobalNOC</cloud>
-    <username>username</username>
-    <password>password</password>
-    <realm>realm</realm>
-  </tsds>
   
 </config>
