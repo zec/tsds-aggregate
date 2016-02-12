@@ -43,6 +43,7 @@ make pure_install
 %{__install} -d -p %{buildroot}/etc/grnoc/tsds/aggregate/
 %{__install} -d -p %{buildroot}/var/lib/grnoc/tsds/aggregate/
 %{__install} -d -p %{buildroot}/usr/bin/
+%{__install} -d -p %{buildroot}/etc/init.d/
 %{__install} -d -p %{buildroot}/usr/share/doc/grnoc/tsds-aggregate/
 
 %{__install} CHANGES.md %{buildroot}/usr/share/doc/grnoc/tsds-aggregate/CHANGES.md
@@ -75,10 +76,13 @@ rm -rf $RPM_BUILD_ROOT
 /usr/share/doc/grnoc/tsds-aggregate/CHANGES.md
 /usr/share/doc/grnoc/tsds-aggregate/INSTALL.md
 
+%defattr(644, root, root, -)
+
 %{perl_vendorlib}/GRNOC/TSDS/Aggregate.pm
 %{perl_vendorlib}/GRNOC/TSDS/Aggregate/Daemon.pm
 %{perl_vendorlib}/GRNOC/TSDS/Aggregate/Aggregator.pm
 %{perl_vendorlib}/GRNOC/TSDS/Aggregate/Aggregator/Worker.pm
+%{perl_vendorlib}/GRNOC/TSDS/Aggregate/Aggregator/Message.pm
 
 %defattr(754, root, root, -)
 
