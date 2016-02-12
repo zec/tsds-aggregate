@@ -73,10 +73,10 @@ rm -rf $RPM_BUILD_ROOT
 %config(noreplace) /etc/grnoc/tsds/aggregate/config.xml
 %config(noreplace) /etc/grnoc/tsds/aggregate/logging.conf
 
+%defattr(644, root, root, -)
+
 /usr/share/doc/grnoc/tsds-aggregate/CHANGES.md
 /usr/share/doc/grnoc/tsds-aggregate/INSTALL.md
-
-%defattr(644, root, root, -)
 
 %{perl_vendorlib}/GRNOC/TSDS/Aggregate.pm
 %{perl_vendorlib}/GRNOC/TSDS/Aggregate/Daemon.pm
