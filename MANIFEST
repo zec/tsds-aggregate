@@ -1,0 +1,17 @@
+bin/tsds-aggregate-daemon
+bin/tsds-aggregate-workers
+CHANGES.md
+conf/config.xml.example
+conf/logging.conf.example
+grnoc-tsds-aggregate.spec
+init.d/tsds-aggregate-daemon
+init.d/tsds-aggregate-workers
+INSTALL.md
+lib/GRNOC/TSDS/Aggregate.pm
+lib/GRNOC/TSDS/Aggregate/Aggregator.pm
+lib/GRNOC/TSDS/Aggregate/Aggregator/Message.pm
+lib/GRNOC/TSDS/Aggregate/Aggregator/Worker.pm
+lib/GRNOC/TSDS/Aggregate/Daemon.pm
+Makefile.PL
+MANIFEST			This list of files
+README.md
