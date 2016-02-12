@@ -55,8 +55,8 @@
   <rabbit>
     <host>127.0.0.1</host>
     <port>5672</port>
-    <pending-queue>pending_aggregate</pending-queue>
-    <finished-queue>finished_aggregate</finished-queue>
+    <pending-queue>timeseries_pending_aggregate</pending-queue>
+    <finished-queue>timeseries_finished_aggregate</finished-queue>
   </rabbit>
   
 </config>
