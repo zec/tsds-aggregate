@@ -7,7 +7,7 @@
     <num-processes>4</num-processes>
 
     <!-- where should we write the aggregator worker pid file to -->
-    <pid-file>/var/run/tsds_aggregator.pid</pid-file>
+    <pid-file>/var/run/tsds-aggregate-workers.pid</pid-file>
 
     <!-- tsds webservice connection info -->
     <tsds>
@@ -33,7 +33,7 @@
     <lock_timeout>120</lock_timeout>
    
     <!-- where should we write the aggregator master pid file to -->
-    <pid-file>/var/run/tsds_aggregator_master.pid</pid-file>
+    <pid-file>/var/run/tsds-aggregate-daemon.pid</pid-file>
 
     <!-- redis connection information for distributed locking -->
     <redis>
