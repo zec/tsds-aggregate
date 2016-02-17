@@ -405,6 +405,8 @@ sub _aggregate_messages {
 
 		my $entries      = $result->{$value_type};
 
+		next if ( !defined( $entries ) );
+
 		# Figure this out once, makes it easier later in the code to
 		# refer to a consistent flag
 		my $is_aggregate = exists($result->{$value_type . "__max"}) ? 1 : 0;
