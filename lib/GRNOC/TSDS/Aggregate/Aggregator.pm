@@ -1,7 +1,6 @@
 package GRNOC::TSDS::Aggregate::Aggregator;
 
 use Moo;
-use Types::Standard qw( Str Bool );
 
 use GRNOC::TSDS::Aggregate::Aggregator::Worker;
 use GRNOC::Config;
@@ -10,6 +9,7 @@ use GRNOC::Log;
 use Parallel::ForkManager;
 use Proc::Daemon;
 
+use Types::Standard qw( Str Bool );
 use Data::Dumper;
 
 ### required attributes ###
