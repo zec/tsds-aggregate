@@ -1,3 +1,9 @@
+## GRNOC TSDS Aggregate 1.0.1 -- Fri Mar 04 2016
+
+### Features:
+ * ISSUE=13132 Fixed issue where upon first install the daemon would make the determination that everything needed aggregation.
+
+
 ## GRNOC TSDS Aggregate 1.0.0 -- Fri Feb 12 2016
 
 ### Features:

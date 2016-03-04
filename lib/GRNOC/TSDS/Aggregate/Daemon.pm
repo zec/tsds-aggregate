@@ -739,7 +739,7 @@ sub _get_data {
     }
     # Otherwise detect anything that needs doing
     else {
-	$query->{'updated'} = {'$gt'  => 0};
+	$query->{'updated'} = {'$gt'  => $last_run};
 	$hint = "updated_1_identifier_1";
     }
 
