@@ -38,7 +38,7 @@ has meta => ( is => 'ro',
 has values => ( is => 'ro',
                 isa => ArrayRef[ Dict[ 'name' => Str,
                                        'hist_res' => Maybe[PositiveNum],
-                                       'hist_min_width' => Maybe[PositiveInt] ] ],
+                                       'hist_min_width' => Maybe[PositiveNum] ] ],
                 required => 1 );
 
 has required_meta => ( is => 'ro',
