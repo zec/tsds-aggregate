@@ -1,3 +1,11 @@
+## GRNOC TSDS Aggregate 1.0.2 -- Tues Apr 19 2016
+
+### Features:
+* ISSUE=708 Fixed edge case where writer would complain about aggregate messages with a histogram width
+with a floating point value. This was only seen in cases where data variances were very small, such
+as in optical readings.
+
+
 ## GRNOC TSDS Aggregate 1.0.1 -- Fri Mar 04 2016
 
 ### Features:
