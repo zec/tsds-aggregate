@@ -2,7 +2,7 @@
 #
 # tsds-aggregate-daemon        init file for starting up the tsds aggregate main work daemon
 #
-# chkconfig:   2345 20 80
+# chkconfig:   2345 86 14
 # description: Starts and stops the tsds aggregate daemon.
 
 # Source function library.
