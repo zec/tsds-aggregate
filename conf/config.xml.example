@@ -29,6 +29,12 @@
     <!-- how many measurements to include in a single rabbit message -->
     <num_messages>10</num_messages>
 
+    <!-- how many documents can be read in a single block. This should be greater than
+         the num_concurrent_measurements to avoid extra looping. A single ->find from the
+         data collections will retrieve this many at most, avoiding timeouts on very
+         large requests if a lot of documents have been dirtied -->
+    <max_docs_per_block>100</max_docs_per_block>
+
     <!-- how long in seconds to hold redis locks (unlikely you should have to change this) -->
     <lock_timeout>120</lock_timeout>
    

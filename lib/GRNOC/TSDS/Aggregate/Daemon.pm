@@ -40,7 +40,7 @@ has daemonize => ( is       => 'ro',
 
 has chunk_size => ( is       => 'rw',
 		    required => 1,
-		    default  => 1000 );
+		    default  => 100 );
 
 has message_size => ( is       => 'rw',
 		      required => 1,
@@ -48,6 +48,9 @@ has message_size => ( is       => 'rw',
 
 has lock_timeout => ( is      => 'rw',
 		      default => 120 );
+
+has max_docs_chunk => ( is      => 'rw',
+		        default => 100 );
 
 has force_database => ( is => 'rw',
 			default => sub { undef } );
@@ -115,7 +118,10 @@ sub BUILD {
     my $lock_timeout = $config->get('/config/master/lock_timeout');
     $self->lock_timeout($lock_timeout) if ($lock_timeout);
 
-    log_info("Starting with chunk size = " . $self->chunk_size() . ", message size = " . $self->message_size() . ", lock timeout = " . $self->lock_timeout());
+    my $max_docs_chunk = $config->get('/config/master/max_docs_per_block');
+    $self->max_docs_chunk($max_docs_chunk) if ($max_docs_chunk);
+
+    log_info("Starting with chunk size = " . $self->chunk_size() . ", message size = " . $self->message_size() . ", lock timeout = " . $self->lock_timeout() . ", max docs chunk = " . $self->max_docs_chunk());
 
     # setup signal handlers
     $SIG{'TERM'} = sub {
@@ -393,42 +399,67 @@ sub _evaluate_policies {
 		# aggregation into this policy
 		foreach my $prev_interval (keys %$work_buckets){
 		    log_debug("Processing data from $prev_interval");
-		    
-		    my $interval_measurements = $work_buckets->{$prev_interval};
-		    
-		    my $dirty_start = [gettimeofday];
-		    my $dirty_docs;
-		    try {
-			$dirty_docs = $self->_get_data(db           => $db_name,
-						       interval     => $prev_interval,
-						       last_run     => $last_run,
-						       measurements => $interval_measurements);
-			log_info("Took " . tv_interval($dirty_start, [gettimeofday]) . " to get dirty docs for $prev_interval bucket");
-		    }
-		    catch {
-			$any_failed = 1;
-			log_warn("Unable to get docs for current measurements, continuing on: $_");
-		    };
-		    next if (! $dirty_docs);
 
-		    
-		    # Create and send out rabbit messages describing work that
-		    # needs doing
-		    my $work_start = [gettimeofday];
-		    my $result = $self->_generate_work(policy        => $policy,
-						       db            => $db_name,
-						       interval_from => $prev_interval,
-						       interval_to   => $interval,
-						       docs          => $dirty_docs,
-						       measurements  => $interval_measurements);
-		    log_debug("Took " . tv_interval($work_start, [gettimeofday]) . " to get generate work for $prev_interval bucket");		  
-  
-		    if (! defined $result){
-			log_warn("Error generating work for $db_name policy $name, skipping");
-			return;
-		    }		
+		    my $block = 0;
+
+		    my $interval_measurements = $work_buckets->{$prev_interval};
+
+		    my @done_ids;
+
+		    # keep getting data until we're finished with this chunk
+		    while (1){
+
+			log_debug("Fetching data block = $block");
+			log_debug("sizeof ignore_doc_ids = " . scalar(@done_ids));
+
+			my $dirty_start = [gettimeofday];
+			my $dirty_docs;
+			try {
+			    $dirty_docs = $self->_get_data(db             => $db_name,
+							   interval       => $prev_interval,
+							   last_run       => $last_run,
+							   measurements   => $interval_measurements,
+							   limit          => $self->max_docs_chunk(),
+							   ignore_doc_ids => \@done_ids);
+			     log_debug("Took " . tv_interval($dirty_start, [gettimeofday]) . " to get dirty docs for $prev_interval bucket");
+			}
+			catch {
+			    $any_failed = 1;
+			    log_warn("Unable to get docs for current measurements, continuing on: $_");
+			};
+
+			# if we had an error or we were finished finding docs in this block, we're done here
+			last if (! $dirty_docs || @$dirty_docs == 0);
+
+			# keep track of the _ids of docs we have already looked at, this will help prevent us
+			# from getting stuck where a doc is live updating and we would otherwise find it
+			# multiple times and miss other things
+			foreach my $dirty_doc (@$dirty_docs){
+			    push(@done_ids, $dirty_doc->{'_id'});
+			}
+
+			# Create and send out rabbit messages describing work that
+			# needs doing
+			my $work_start = [gettimeofday];
+			my $result = $self->_generate_work(policy        => $policy,
+							   db            => $db_name,
+							   interval_from => $prev_interval,
+							   interval_to   => $interval,
+							   docs          => $dirty_docs,
+							   measurements  => $interval_measurements);
+			log_debug("Took " . tv_interval($work_start, [gettimeofday]) . " to get generate work for $prev_interval bucket");
+		  
+			if (! defined $result){
+			    log_warn("Error generating work for $db_name policy $name, skipping");
+			    return;
+			}		
+
+			# Increment to our next block
+			$block++;
+		    }
 		}
 	    }
+
 	    # Update the aggregate to show the last time we successfully 
 	    # generated work for this
 	    
@@ -750,18 +781,23 @@ sub _find_previous_policies {
 sub _get_data {
     my ( $self, %args ) = @_;
 
-    my $db_name      = $args{'db'};
-    my $interval     = $args{'interval'};
-    my $last_run     = $args{'last_run'};
-    my $measurements = $args{'measurements'};
+    my $db_name          = $args{'db'};
+    my $interval         = $args{'interval'};
+    my $last_run         = $args{'last_run'};
+    my $measurements     = $args{'measurements'};
+    my $limit            = $args{'limit'};
+    my $ignore_doc_ids   = $args{'ignore_doc_ids'};
 
-    my @ids = keys %$measurements;
+    my @identifiers = keys %$measurements;
 
     # our base query, always scope to just these identifiers
     my $query = {
-	'identifier' => {'$in'  => \@ids}
+	'identifier' => {'$in'  => \@identifiers},
+	'_id' => {'$not' => {'$in' => $ignore_doc_ids}}, # skip any data docs we saw in a previous run.
+	                                                 # this prevents the issue where you get stuck with a doc
+	                                                 # that is being updated and you keep re-finding it
     };
-    
+
     # If we were given a start/end time, use that
     my $hint;
     if (defined $self->force_start){
@@ -795,7 +831,8 @@ sub _get_data {
     my $fetch_1_start = [gettimeofday];
     my $cursor;
     try {
-	$cursor = $collection->find($query)->hint($hint)->fields($fields);
+	$cursor = $collection->find($query)->hint($hint)->fields($fields)
+	    ->limit($limit)
     }
     catch {
 	log_warn("Unable to find dirty documents in $db_name at interval $interval: $_");
@@ -863,7 +900,6 @@ sub _get_data {
     }   
     
     log_info("Found " . scalar(@final_docs) . " final dirty docs to work on in " . tv_interval($fetch_2_start, [gettimeofday]) . " seconds");
-
     
     return \@final_docs;
 }
