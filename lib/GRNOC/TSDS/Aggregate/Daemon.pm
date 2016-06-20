@@ -11,6 +11,7 @@ use GRNOC::Config;
 use GRNOC::Log;
 
 use Proc::Daemon;
+use Parallel::ForkManager;
 
 use POSIX;
 use Data::Dumper;
@@ -165,9 +166,7 @@ sub start {
 
         log_debug( 'Running in foreground.' );
     }
-
-    $self->_connect();
-
+    
     $self->_work_loop();
 
     return 1;
@@ -189,6 +188,9 @@ sub _work_loop {
     log_debug("Entering main work loop");
 
     while (1){
+
+	# reconncet
+	$self->_connect();		
 
         my $next_wake_time;
     
@@ -213,45 +215,76 @@ sub _work_loop {
 	# they change
 	$self->_set_identifiers({});
 
-        # For each of those databases, determine whether
-        # it's time to do work yet or not
-        foreach my $db_name (keys %$dbs){
-            my $policies = $dbs->{$db_name};
-	    
-	    my $next_run;
-	    my $failed = 0;
-	    try {
-		# Make sure we know the required fields for this database
-		my $success = $self->_get_metadata($db_name);
-		return if (! defined $success);		
+	# We need to fork here because perl doesn't do a very good job of releasing
+	# memory back to the system, and the next block can be expensive if there
+	# is a lot to do at some iteration, so this is how we get around that as a 
+	# long lived process. Yeah...
+	my $fm = Parallel::ForkManager->new(1);
 
-		$next_run = $self->_evaluate_policies($db_name, $policies);
-		return if (! defined $next_run);
+	# the fork is going to return the calculated next wake up time
+	# back to us so we can sleep in the parent
+	$fm->run_on_finish(
+	    sub {
+		my ($pid,$exit_code,$ident,$exit_signal,$core_dump,$data)=@_;
+
+		log_debug("Fork $pid exited with status = $exit_code, args = " . Dumper($data));
+
+		if ($data && ref($data) eq 'ARRAY' && @$data > 0){
+		    $next_wake_time = $data->[0];
+		}
+	    }
+	    );
+	
+	# in the child
+	if (! $fm->start){
+
+	    # reconnect in fork
+	    $self->_connect();		
+
+	    # For each of those databases, determine whether
+	    # it's time to do work yet or not
+	    foreach my $db_name (keys %$dbs){
+		my $policies = $dbs->{$db_name};
 		
-		log_info("Next run is $next_run for $db_name (" . localtime($next_run) . ")");
+		my $next_run;
+		my $failed = 0;
+		try {
+		    # Make sure we know the required fields for this database
+		    my $success = $self->_get_metadata($db_name);
+		    return if (! defined $success);		
+		    
+		    $next_run = $self->_evaluate_policies($db_name, $policies);
+		    return if (! defined $next_run);
+		    
+		    log_info("Next run is $next_run for $db_name (" . localtime($next_run) . ")");
+		}
+		catch {
+		    log_warn("Caught exception while processing $db_name: $_");
+		    $failed = 1;
+		};
+		
+		# if we failed for whatever reason, reconnect to everything as a safety
+		if ($failed){
+		    log_info("Reconnecting to everything due to failure");
+		    $self->_connect();		
+		}
+		
+		# Possibly redundant release in case an exception happened above, want
+		# to make sure we're not hanging on to things
+		$self->_release_locks();
+
+		next if (! defined $next_run);
+		
+		# Figure out when the next time we need to look at this is.
+		# If it's closer than anything else, update our next wake 
+		# up time to that
+		$next_wake_time = $next_run if (! defined $next_wake_time || $next_run < $next_wake_time);	    
 	    }
-	    catch {
-		log_warn("Caught exception while processing $db_name: $_");
-		$failed = 1;
-	    };
-	    
-	    # if we failed for whatever reason, reconnect to everything as a safety
-	    if ($failed){
-		log_info("Reconnecting to everything due to failure");
-		$self->_connect();		
-	    }
 
-	    # Possibly redundant release in case an exception happened above, want
-	    # to make sure we're not hanging on to things
-	    $self->_release_locks();
-
-	    next if (! defined $next_run);
-
-	    # Figure out when the next time we need to look at this is.
-	    # If it's closer than anything else, update our next wake 
-	    # up time to that
-	    $next_wake_time = $next_run if (! defined $next_wake_time || $next_run < $next_wake_time);	    
+	    $fm->finish(0, [$next_wake_time]);
 	}
+
+	$fm->wait_all_children();
 
 	# If a specific timeframe was given, we're all done now
 	if ($self->force_start){
@@ -265,7 +298,6 @@ sub _work_loop {
 	}
        
         log_debug("Next wake time is $next_wake_time (" . localtime($next_wake_time) . ")");
-
 
         # Sleep until the next time we've determined we need to do something
         my $delta = $next_wake_time - time;
