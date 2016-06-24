@@ -1,6 +1,6 @@
 Summary: GRNOC TSDS Aggregate
 Name: grnoc-tsds-aggregate
-Version: 1.0.2
+Version: 1.0.3
 Release: 1%{?dist}
 License: GRNOC
 Group: Measurement
