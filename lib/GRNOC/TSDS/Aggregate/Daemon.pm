@@ -688,7 +688,7 @@ sub _get_measurements {
 
     my $duration = tv_interval($start, [gettimeofday]);
 
-    log_info("Found " . scalar(keys %lookup) . " measurements for $db_name policy $name in $duration seconds");
+    log_debug("Found " . scalar(keys %lookup) . " measurements for $db_name policy $name in $duration seconds");
 
     return \%lookup;
 }
@@ -840,14 +840,14 @@ sub _get_data {
 
     return if (! $cursor);
 
-    log_info("Query executed in " . tv_interval($fetch_1_start, [gettimeofday]) . " seconds");
+    log_debug("Query executed in " . tv_interval($fetch_1_start, [gettimeofday]) . " seconds");
 
     my @docs;
     while (my $doc = $cursor->next() ){
 	push(@docs, $doc);	
     }
 
-    log_info("Found " . scalar(@docs) . " dirty docs in " . tv_interval($fetch_1_start, [gettimeofday]) ." seconds, attempting to get locks");
+    log_debug("Found " . scalar(@docs) . " dirty docs in " . tv_interval($fetch_1_start, [gettimeofday]) ." seconds, attempting to get locks");
 
     # This part is a bit strange. We have to do a first fetch to figure out
     # what all docs we're going to need to touch. Then we need to lock them
@@ -873,7 +873,7 @@ sub _get_data {
 	push(@{$self->locks()}, $lock);
     }
 
-    log_info("Got locks in " . tv_interval($lock_start, [gettimeofday]) . " seconds");
+    log_debug("Got locks in " . tv_interval($lock_start, [gettimeofday]) . " seconds");
     log_debug("Internal IDs size is " . scalar(@internal_ids));
 
     my $fetch_2_start = [gettimeofday];
@@ -899,7 +899,7 @@ sub _get_data {
 	push(@final_docs, $doc);
     }   
     
-    log_info("Found " . scalar(@final_docs) . " final dirty docs to work on in " . tv_interval($fetch_2_start, [gettimeofday]) . " seconds");
+    log_debug("Found " . scalar(@final_docs) . " final dirty docs to work on in " . tv_interval($fetch_2_start, [gettimeofday]) . " seconds");
     
     return \@final_docs;
 }
@@ -1084,7 +1084,7 @@ sub _generate_work {
 
     my $duration = tv_interval($start, [gettimeofday]);
 
-    log_info("All work messages sent to rabbit in $duration seconds");
+    log_debug("All work messages sent to rabbit in $duration seconds");
 
     $start = [gettimeofday];
 
@@ -1113,7 +1113,7 @@ sub _generate_work {
     return if (! $result);
 
     $duration = tv_interval($start, [gettimeofday]);
-    log_info("Cleared updated flags in $duration seconds");
+    log_debug("Cleared updated flags in $duration seconds");
 
     # We can go ahead and let go of all of our locks now
     $self->_release_locks();
