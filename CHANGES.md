@@ -1,3 +1,17 @@
+## GRNOC TSDS Aggregate 1.0.3 -- Fri Jun 24 2016
+
+### Features:
+* ISSUE=530 Added knob to control maximum amount of data fetched in a single
+block. This allows better control over server behavior and should help with situations
+like data backfill from choking up the server.
+
+
+### Fixes:
+* ISSUE=821 Slight change in architecture to fork a new temporary process that does
+the actual work to work around perl memory management issues. Impact should be that
+while idling until next run considerably less memory should be held onto.
+
+
 ## GRNOC TSDS Aggregate 1.0.2 -- Tues Apr 19 2016
 
 ### Features:
