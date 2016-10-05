@@ -1,3 +1,11 @@
+## GRNOC TSDS Aggregate 1.0.4 -- Wed Oct 5 2016
+
+### Fixes:
+* ISSUE=1971 Fixed edge case where in some cases queries to TSDS services
+would fail but that failure would not be properly trapped and requeued, resulting
+in missed aggregations.
+
+
 ## GRNOC TSDS Aggregate 1.0.3 -- Fri Jun 24 2016
 
 ### Features:

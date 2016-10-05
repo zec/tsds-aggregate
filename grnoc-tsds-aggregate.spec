@@ -1,6 +1,6 @@
 Summary: GRNOC TSDS Aggregate
 Name: grnoc-tsds-aggregate
-Version: 1.0.3
+Version: 1.0.4
 Release: 1%{?dist}
 License: GRNOC
 Group: Measurement
@@ -23,7 +23,7 @@ Requires: perl-Time-HiRes
 Requires: perl-Moo
 Requires: perl-Types-XSD-Lite
 Requires: perl-Parallel-ForkManager
-Requires: perl-GRNOC-WebService-Client
+Requires: perl-GRNOC-WebService-Client >= 1.3.3
 Requires: perl-Math-Round
 
 %description
