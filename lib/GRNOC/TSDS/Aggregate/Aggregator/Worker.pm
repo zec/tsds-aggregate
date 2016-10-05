@@ -363,7 +363,7 @@ sub _aggregate_messages {
 					    output => 'bson');
 
 	# handle any errors attempting to query the webservice
-	if ( !$results ) {
+	if ( !$results || $self->websvc->get_error() ) {
 
 	    die( "Error querying TSDS web service: " . $self->websvc->get_error() );
 	}
