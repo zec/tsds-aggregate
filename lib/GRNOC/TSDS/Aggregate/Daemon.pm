@@ -469,7 +469,7 @@ sub _evaluate_policies {
 	    if (! $any_failed && ! defined $self->force_start){
 		$self->mongo->get_database($db_name)
 		    ->get_collection("aggregate")
-		    ->update({"name" => $name}, {'$set' => {"last_run" => $floored}});		
+		    ->update_one({"name" => $name}, {'$set' => {"last_run" => $floored}});		
 	    }
 	    # Since we ran, the next time we need to look is the next time this
 	    # the next time its interval is coming around in the future
@@ -493,7 +493,7 @@ sub _get_metadata {
     my $metadata;
 
     try {
-	$metadata = $self->mongo->get_database($db_name)->get_collection('metadata')->find_one();
+	$metadata = $self->mongo->get_database($db_name)->get_collection('metadata')->find_one([]);
     }
     catch {
 	log_warn("Error getting metadata from mongo for $db_name: $_");
@@ -636,7 +636,7 @@ sub _get_measurements {
 	    $cursor = $self->mongo
 		->get_database($db_name)
 		->get_collection('measurements')
-		->aggregate(\@agg, {cursor => 1});
+		->aggregate(\@agg);
 	}
 	catch {
 	    log_warn("Unable to fetch latest measurement entries for $db_name policy $name: $_");
@@ -667,8 +667,8 @@ sub _get_measurements {
 	    $cursor = $self->mongo
 		->get_database($db_name)
 		->get_collection('measurements')
-		->find({'identifier' => {'$in' => \@identifiers},
-			'start'      => {'$in' => \@starts}})->fields($fields);
+		->find(['identifier' => {'$in' => \@identifiers},
+			'start'      => {'$in' => \@starts}])->fields($fields);
 	}
 	catch {
 	    log_warn("Unable to execute latest measurement entries query with fields for $db_name policy $name: $_");
@@ -791,23 +791,23 @@ sub _get_data {
     my @identifiers = keys %$measurements;
 
     # our base query, always scope to just these identifiers
-    my $query = {
+    my $query = Tie::IxHash->new(
 	'identifier' => {'$in'  => \@identifiers},
 	'_id' => {'$not' => {'$in' => $ignore_doc_ids}}, # skip any data docs we saw in a previous run.
 	                                                 # this prevents the issue where you get stuck with a doc
 	                                                 # that is being updated and you keep re-finding it
-    };
+    );
 
     # If we were given a start/end time, use that
     my $hint;
     if (defined $self->force_start){
-	$query->{'start'} = {'$lte' => $self->force_end};
-	$query->{'end'}   = {'$gte' => $self->force_start};
+        $query->Push('start' => {'$lte' => $self->force_end});
+	$query->Push('end'   => {'$gte' => $self->force_start});
 	$hint = "identifier_1_start_1_end_1";
     }
     # Otherwise detect anything that needs doing
     else {
-	$query->{'updated'} = {'$gt'  => $last_run};
+	$query->Push('updated' => {'$gt'  => $last_run});
 	$hint = "updated_1_identifier_1";
     }
 
@@ -885,7 +885,7 @@ sub _get_data {
     # Now that they're all locked, fetch them again
     undef $cursor;
     try {
-	$cursor = $collection->find({_id => {'$in' => \@internal_ids}})->fields($fields);		
+	$cursor = $collection->find([_id => {'$in' => \@internal_ids}])->fields($fields);		
     }
     catch {
 	log_warn("Unable to find dirty documents on fetch 2: $_");
@@ -1100,11 +1100,10 @@ sub _generate_work {
 
     my $result;
     try {
-	$result = $collection->update({_id => {'$in' => \@clear_doc_ids}},
-				      {'$unset' => {'updated'       => 1,
-						    'updated_start' => 1,
-						    'updated_end'   => 1}},
-				      {multiple => 1});
+	$result = $collection->update_many({_id => {'$in' => \@clear_doc_ids}},
+                                           {'$unset' => {'updated'       => 1,
+                                                         'updated_start' => 1,
+                                                         'updated_end'   => 1}});
     }
     catch {
 	log_warn("Unable to clear updated flags on data docs: $_");	
@@ -1142,7 +1141,7 @@ sub _get_aggregate_policies {
 
 	my $authorized = 1;
 	try {
-            $cursor = $self->mongo->get_database($db_name)->get_collection("aggregate")->find();
+            $cursor = $self->mongo->get_database($db_name)->get_collection("aggregate")->find([]);
 	    while (my $doc = $cursor->next()){
 
 		if (! defined $doc->{'eval_position'} || ! defined $doc->{'interval'}){
@@ -1207,7 +1206,7 @@ sub _mongo_connect {
     try {
         $mongo = MongoDB::MongoClient->new(
             host => "$mongo_host:$mongo_port",
-            query_timeout => -1,
+            socket_timeout_ms => -1,
             username => $user,
             password => $pass
             );
@@ -1313,7 +1312,7 @@ sub _release_locks {
 sub _verify_indexes {
     my ( $self, $db_name, $col_name ) = @_;
 
-    my @indexes = $self->mongo()->get_database($db_name)->get_collection($col_name)->get_indexes();
+    my @indexes = $self->mongo()->get_database($db_name)->get_collection($col_name)->indexes()->list->all;
 
     my $found = 0;
     foreach my $index (@indexes){
