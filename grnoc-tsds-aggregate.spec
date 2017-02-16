@@ -14,7 +14,7 @@ Requires: perl-GRNOC-Log
 Requires: perl-GRNOC-Config
 Requires: perl-Proc-Daemon
 Requires: perl-List-MoreUtils
-Requires: perl-MongoDB
+Requires: perl-MongoDB >= 1.0
 Requires: perl-Net-AMQP-RabbitMQ
 Requires: perl-JSON-XS
 Requires: perl-Redis
